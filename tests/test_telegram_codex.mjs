@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, localProjects, telegramImage, saveTelegramImage, quotaText } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, localProjects, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
@@ -136,6 +136,102 @@ assert.equal(groupMessages[0].message_thread_id, 101);
 assert.equal(groupState.routes['-1001234:7'], 'A');
 await groupBridge.handle({ update_id: 104, message: { ...msg, text: '/help' } });
 assert.equal(groupMessages.at(-1).chat_id, owner, 'private help must remain private');
+
+// New topics import five completed pairs, not commentary, tools or unfinished output.
+const historyTurn = n => ({ id: 'history-' + n, status: 'completed', items: [
+  { type: 'userMessage', content: [{ type: 'text', text: 'prompt ' + n }] },
+  { type: 'agentMessage', id: 'comment-' + n, phase: 'commentary', text: 'working' },
+  { type: 'commandExecution', output: { text: 'PRIVATE_TOOL_LOG' } },
+  { type: 'agentMessage', id: 'answer-' + n, phase: 'final_answer', text: 'response ' + n },
+] });
+assert.equal(historyPair({ ...historyTurn(1), status: 'inProgress' }), null);
+assert.equal(historyPair({ status: 'completed', items: [historyTurn(1).items.at(-1)] }), null);
+const delegated = { id: 'delegated', status: 'completed', items: [
+  { type: 'functionCallOutput', namespace: 'codex_app', name: 'send_message_to_thread',
+    output: { text: '<codex_delegation>\n<source_thread_id>source</source_thread_id>\n<input>Telegram prompt</input>\n</codex_delegation>' } },
+  historyTurn(1).items.at(-1),
+] };
+assert.equal(historyPair(delegated).prompt, 'Telegram prompt');
+assert.equal(historyPair({ ...delegated, items: [{ ...delegated.items[0], name: 'arbitrary_tool' }, delegated.items[1]] }), null);
+assert.equal(historyPair({ ...delegated, items: [{ ...delegated.items[0], name: 'create_thread' }, delegated.items[1]] }).prompt, 'Telegram prompt');
+
+const historyTurns = [{ ...historyTurn(8), status: 'inProgress' },
+  ...Array.from({ length: 7 }, (_, i) => historyTurn(7 - i))];
+const historyState = { topicMode: true, topics: {}, routes: {}, threads: { A: { ...t } },
+  seen: { A: { keys: [], turnId: 'history-7', updatedAt: 0 } } };
+const historyCalls = [], historyMessages = [];
+const historyBridge = new Bridge({ ownerId: owner }, historyState, async (tool, args) => {
+  historyCalls.push({ tool, args });
+  if (tool === 'list_threads') return { pinnedThreads: [], threads: [{ ...t, status: 'notLoaded', updatedAt: 2 }] };
+  assert.equal(tool, 'read_thread'); assert.equal(args.turnLimit, 1);
+  if (!args.includeOutputs) return { turns: [historyTurn(7)], page: {} };
+  const index = Number(args.cursor || 0);
+  await new Promise(resolve => setImmediate(resolve));
+  return { turns: [historyTurns[index]], page: { nextCursor: String(index + 1) } };
+}, async (method, args) => {
+  historyMessages.push({ method, args });
+  return method === 'createForumTopic' ? { message_thread_id: 505 } : { message_id: historyMessages.length };
+}, () => {});
+await Promise.all([historyBridge.send('live first', 'A'), historyBridge.send('live second', 'A')]);
+assert.equal(historyMessages.filter(m => m.method === 'createForumTopic').length, 1);
+assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 6, 'skip unfinished turn, stop after five pairs');
+const imported = historyMessages.filter(m => m.method === 'sendMessage').map(m => m.args.text);
+assert(imported[0].startsWith('Lịch sử: 5 cặp'));
+assert.deepEqual(imported.slice(1, 11), [3,4,5,6,7].flatMap(n => ['Bạn:\nprompt ' + n, 'Codex:\nresponse ' + n]));
+assert.deepEqual(new Set(imported.slice(11)), new Set(['live first', 'live second']), 'concurrent live sends wait for history');
+assert(historyMessages.filter(m => m.method === 'sendMessage').every(m => m.args.message_thread_id === 505));
+assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG') && !imported.includes('working'));
+const historyCount = historyCalls.length;
+await historyBridge.topic('A');
+assert.equal(historyCalls.length, historyCount, 'existing topics must not reimport history');
+await historyBridge.scan();
+assert(!historyMessages.some(m => m.args.text === 'response 7'), 'imported answer must not also be sent by scanner');
+
+const emptyHistoryMessages = [];
+let emptyHistoryFails = false;
+const emptyHistory = new Bridge({ ownerId: owner }, { topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' }, B: { title: 'B' } }, seen: {} },
+  async () => { if (emptyHistoryFails) throw new Error('history unavailable'); return { turns: [], page: {} }; },
+  async (method, args) => { emptyHistoryMessages.push({ method, args }); return { message_thread_id: 606, message_id: emptyHistoryMessages.length }; }, () => {});
+await emptyHistory.send('new chat', 'A');
+assert.equal(emptyHistoryMessages.filter(m => m.method === 'sendMessage').length, 1, 'empty chat has no invented pairs');
+emptyHistoryFails = true;
+await emptyHistory.send('live', 'B');
+assert(emptyHistoryMessages.some(m => m.args.text?.includes('chưa kéo đủ lịch sử: history unavailable')));
+assert.equal(emptyHistoryMessages.at(-1).args.text, 'live', 'history failure must not block live messages');
+
+// Personal-account history keeps the sender roles and never re-executes old prompts.
+const roleMessages = [], replayUpdates = [], roleCalls = [];
+const roleState = { topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' } }, seen: {} };
+let roleBridge, personalId = 9000;
+roleBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, roleState, async (tool, args) => {
+  roleCalls.push({ tool, args });
+  if (tool === 'read_thread') return { turns: [historyTurn(1)], page: {} };
+  return {};
+}, async (method, args) => {
+  roleMessages.push({ sender: 'bot', method, ...args });
+  return { message_thread_id: 707, message_id: roleMessages.length };
+}, () => {}, undefined, async (text, topicId) => {
+  const id = ++personalId;
+  assert.equal(roleState.historyPending['-1001234:707'], text, 'persist replay intent before sending');
+  roleMessages.push({ sender: 'user', text, topicId });
+  const replay = { ...msg, message_id: id, text, message_thread_id: topicId, chat: { id: -1001234, type: 'supergroup' } };
+  replayUpdates.push(roleBridge.handle({ message: replay })); // Bot update can arrive before sendMessage returns.
+  return { id };
+});
+await roleBridge.send('connected', 'A');
+await Promise.all(replayUpdates);
+assert(roleMessages.some(m => m.sender === 'user' && m.text === 'prompt 1' && m.topicId === 707));
+assert(roleMessages.some(m => m.sender === 'bot' && m.text === 'response 1' && m.message_thread_id === 707));
+assert(!roleMessages.some(m => /^Bạn:|^Codex:/.test(m.text || '')), 'real sender roles need no artificial prefixes');
+assert(!roleCalls.some(c => c.tool === 'send_message_to_thread'), 'replayed history must not become a Codex prompt');
+await roleBridge.handle({ message: { ...msg, text: 'fresh prompt', message_id: 9999,
+  message_thread_id: 707, chat: { id: -1001234, type: 'supergroup' } } });
+assert.equal(roleCalls.filter(c => c.tool === 'send_message_to_thread').length, 1, 'fresh user messages still dispatch');
+roleState.historyPending['-1001234:707'] = 'uncertain replay';
+await roleBridge.handle({ message: { ...msg, text: 'uncertain replay', message_id: 10000,
+  message_thread_id: 707, chat: { id: -1001234, type: 'supergroup' } } });
+assert.equal(roleCalls.filter(c => c.tool === 'send_message_to_thread').length, 1, 'an uncertain replay after restart must not execute');
+assert(roleMessages.at(-1).text.includes('kết quả gửi chưa xác định'));
 
 // Quota is an account command: no prompt dispatch, even while New chat is pending.
 const quota = { rateLimitsByLimitId: { codex: { limitId: 'codex',

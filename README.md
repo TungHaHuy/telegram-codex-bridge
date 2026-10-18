@@ -1,8 +1,9 @@
 # Telegram ↔ Codex trên Windows
 
 Điều khiển các chat Codex trên máy bằng Telegram: gửi prompt, gửi ảnh, steer khi
-Codex đang làm và nhận phản hồi/lỗi về điện thoại. Chạy bằng Node.js có sẵn,
-không cần npm install, OpenAI API key, server công khai hay tunnel.
+Codex đang làm và nhận phản hồi/lỗi về điện thoại. Chế độ Bot API chạy bằng
+Node.js có sẵn, không cần npm install. Chế độ tài khoản cá nhân có bước cài thêm
+bên dưới. Không cần OpenAI API key, server công khai hay tunnel.
 
 Đây là cầu nối tự viết, dùng các công cụ của Codex App đang mở. Máy và Codex App
 phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Codex.
@@ -12,6 +13,7 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
 - `/projects` → chọn project → **＋ New chat** và 5 chat gần nhất trong project.
 - Bấm New chat rồi gửi prompt đầu tiên để tạo chat trong đúng project.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
+- Topic mới tự lấy tối đa 5 cặp prompt–response đã hoàn tất gần nhất, từ cũ đến mới.
 - Nhắn trong topic để gửi prompt hoặc steer; phản hồi và lỗi về cùng topic.
 - Gửi ảnh Photo hoặc file PNG/JPEG/WebP, có thể kèm caption làm yêu cầu.
 - `/quota` xem hạn mức tài khoản và thời điểm reset theo giờ Việt Nam.
@@ -102,6 +104,47 @@ Nếu không dùng Topics, `/chats` chọn chat cho tin tiếp theo; Reply một
 bot cũng gửi vào đúng chat của tin đó. Trong topic, chính topic quyết định tuyến,
 không bị lựa chọn chat cũ hoặc Reply sang chat khác ghi đè.
 
+## Hiển thị lịch sử đúng người gửi
+
+Khi tạo topic, bridge lấy tối đa 5 cặp đã có câu trả lời cuối cùng; chat ít hơn
+5 cặp lấy phần đang có. Lượt đang chạy, reasoning, commentary và log công cụ
+không được nhập làm câu trả lời lịch sử. Topic đã có không nhập lại mỗi lần mở.
+
+Mặc định Bot API trích dẫn prompt bằng nhãn `Bạn:` và trả lời bằng nhãn `Codex:`.
+Để **prompt thực sự là tin từ tài khoản của bạn**, còn response là tin từ bot,
+cần đăng nhập thêm Telegram cá nhân bằng MTProto. Chỉ bật nếu bạn đồng ý cho
+ứng dụng gửi các prompt lịch sử vào nhóm riêng đã cấu hình.
+
+1. Đăng nhập [my.telegram.org/apps](https://my.telegram.org/apps), tạo API app của
+   chính bạn và đọc/chấp nhận [Telegram API Terms](https://core.telegram.org/api/terms).
+   Lấy `api_id` và `api_hash`; không dùng token BotFather thay cho hai giá trị này.
+2. Cài phần phụ thuộc riêng cho chức năng tài khoản cá nhân và chạy setup:
+
+   ```powershell
+   npm install --prefix .telegram-codex/user-client --save-exact teleproto@1.230.1 qrcode@1.5.4
+   node scripts/telegram_user.mjs --login
+   ```
+
+3. Nhập api_id/api_hash khi được hỏi. Mở `.telegram-codex/user-login-qr.png`,
+   dùng Telegram điện thoại → Settings → Devices → Link Desktop Device để quét.
+   Nếu có mật khẩu 2 bước, nhập trong terminal (ẩn ký tự). QR được làm mới khi
+   Telegram yêu cầu; file QR bị xóa khi setup kết thúc.
+4. Setup chỉ lưu phiên nếu ID tài khoản khớp đúng người đã ghép bot. Khởi động
+   lại bridge; nó chỉ gửi lịch sử bằng tài khoản cá nhân vào đúng nhóm cấu hình.
+   Có thể thu hồi phiên trong Telegram → Settings → Devices.
+
+API hash và phiên đăng nhập nằm trong `.telegram-codex/user-session.json`, cùng
+folder riêng đã được bảo vệ và gitignore. Không gửi chúng vào issue hoặc commit.
+Các tin prompt do bridge nhập lại được ghi nhận ID để **không chạy lại trong
+Codex**; tin người dùng mới vẫn được gửi bình thường. Nếu phiên hết hạn, phần
+nhập lịch sử báo lỗi; các chức năng bot khác vẫn chạy.
+
+Kiểm thử tự động bao phủ việc giữ đúng vai và không chạy lại prompt lịch sử,
+kể cả update đến trước khi thao tác gửi trả về. Cần hoàn tất đăng nhập cá nhân
+trên từng máy và kiểm tra topic thật trước khi coi cấu hình máy đó đã sẵn sàng.
+Bản triển khai đã kiểm chứng trên nhóm riêng: 5 prompt mang đúng tài khoản chủ
+bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượt chạy mới.
+
 ## Các lệnh và ảnh
 
 | Lệnh | Tác dụng |
@@ -153,7 +196,7 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   nằm trong `.telegram-codex/`, được gitignore. Folder giới hạn quyền cho tài khoản
   Windows hiện tại và SYSTEM. Bản nguồn không chứa cấu hình cá nhân đã ghép.
 - Bot theo dõi 50 chat Codex local gần nhất, chat ghim và các chat đã chọn/Reply;
-  chỉ ghi mốc lúc gặp chat lần đầu, không đổ lịch sử cũ sang Telegram.
+  chỉ ghi mốc lúc gặp chat lần đầu. Riêng khi tạo topic mới, lấy 5 cặp gần nhất.
 - Phản hồi và lỗi được chuyển về Telegram; reasoning và log công cụ không được
   chuyển. Mỗi item lịch sử được đọc tối đa 20.000 ký tự. Máy phải còn bật/mạng.
 - Bot không tự duyệt yêu cầu cấp quyền của Codex. Khi cần duyệt, xử lý trên App.
@@ -172,3 +215,5 @@ Lệnh nhóm phải được chuẩn hóa một lần tại điểm nhận; ki�
 bot. Đọc lịch sử một lượt/lần và cô lập lỗi từng chat vì response có giới hạn
 kích thước. Khi tạo chat, đăng ký mốc rỗng trước lượt scan tiếp theo để không mất
 phản hồi đầu quá nhanh. Các tình huống này có kiểm tra hồi quy trong test hiện có.
+Tin gửi bằng phiên cá nhân sẽ quay về Bot API như tin của chủ bot: phải ghi nhận
+ID và chờ thao tác nhập lịch sử đang chạy trước khi xử lý update, tránh lặp prompt.

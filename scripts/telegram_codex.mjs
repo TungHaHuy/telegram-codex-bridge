@@ -179,24 +179,47 @@ export function events(turns) {
   return result;
 }
 
+export function historyPair(turn) {
+  if (turn.status === 'inProgress') return null;
+  const prompts = [];
+  const replies = [];
+  for (const item of turn.items || []) {
+    if (item.type === 'userMessage') {
+      const text = (item.content || []).map(part => part.type === 'text' ? part.text : '[Ảnh]').join('\n');
+      if (text.trim()) prompts.push(text);
+    }
+    if (item.type === 'functionCallOutput' && item.namespace === 'codex_app' &&
+        ['create_thread', 'send_message_to_thread'].includes(item.name)) {
+      const input = item.output?.text?.match(/^<codex_delegation>\s*<source_thread_id>[^<]+<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/);
+      if (input) prompts.push(input[1]);
+    }
+    if (item.type === 'agentMessage' && item.text && (!item.phase || item.phase === 'final_answer')) replies.push(item.text);
+  }
+  if (turn.error) replies.push('Lỗi Codex: ' + JSON.stringify(turn.error));
+  return prompts.length && replies.length ? { turn, prompt: prompts.join('\n\n'), response: replies.join('\n\n') } : null;
+}
+
 export class Bridge {
-  constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token)) {
+  constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal) {
     this.config = config;
     this.state = state;
     this.call = call;
     this.telegram = telegram;
     this.persist = persist;
     this.receiveImage = receiveImage;
+    this.sendPersonal = sendPersonal;
     this.readErrors = new Map();
     this.creatingTopics = new Map();
     this.state.topics ||= {};
     this.state.projects ||= {};
     this.state.newChats ||= {};
+    this.state.ignoredPrompts ||= {};
+    this.state.historyPending ||= {};
     this.creatingChat = false;
   }
 
   async topic(threadId) {
-    if (this.state.topics[threadId]) return this.state.topics[threadId];
+    if (!this.creatingTopics.has(threadId) && this.state.topics[threadId]) return this.state.topics[threadId];
     if (!this.creatingTopics.has(threadId)) {
       const creating = (async () => {
         const topic = await this.telegram('createForumTopic', {
@@ -205,12 +228,54 @@ export class Bridge {
         });
         this.state.topics[threadId] = topic.message_thread_id;
         this.persist();
+        try { await this.history(threadId, topic.message_thread_id); }
+        catch (error) {
+          await this.send('Topic đã tạo, nhưng chưa kéo đủ lịch sử: ' + error.message, null,
+            { message_thread_id: topic.message_thread_id });
+        }
         return topic.message_thread_id;
       })();
       this.creatingTopics.set(threadId, creating);
     }
     try { return await this.creatingTopics.get(threadId); }
     finally { this.creatingTopics.delete(threadId); }
+  }
+
+  async history(threadId, topicId) {
+    const pairs = [];
+    let cursor;
+    do {
+      const result = await this.call('read_thread', {
+        threadId, hostId: 'local', turnLimit: 1, includeOutputs: true,
+        maxOutputCharsPerItem: 20000, ...(cursor ? { cursor } : {}),
+      });
+      for (const turn of result.turns || []) {
+        const pair = historyPair(turn);
+        if (pair) pairs.push(pair);
+      }
+      cursor = result.page?.nextCursor;
+    } while (pairs.length < 5 && cursor);
+    const recent = pairs.slice(0, 5).reverse();
+    if (!recent.length) return;
+    const destination = { message_thread_id: topicId };
+    await this.send('Lịch sử: ' + recent.length + ' cặp prompt–response gần nhất (từ cũ đến mới).', null, destination);
+    for (const pair of recent) {
+      if (this.sendPersonal) {
+        for (const part of chunks(pair.prompt)) {
+          const pendingKey = this.config.chatId + ':' + topicId;
+          this.state.historyPending[pendingKey] = part;
+          this.persist();
+          const sent = await this.sendPersonal(part, topicId);
+          this.state.ignoredPrompts[this.config.chatId + ':' + sent.id] = true;
+          delete this.state.historyPending[pendingKey];
+          this.persist();
+        }
+      } else await this.send('Bạn:\n' + pair.prompt, null, destination);
+      await this.send((this.sendPersonal ? '' : 'Codex:\n') + pair.response, null, destination);
+    }
+    const prior = this.state.seen[threadId];
+    if (prior) prior.keys = [...new Set([...prior.keys, ...events(recent.map(pair => pair.turn)).map(event => event.key)])];
+    this.persist();
   }
 
   async send(text, threadId, extra = {}) {
@@ -291,6 +356,15 @@ export class Bridge {
     if (!message || !authorized({ ...message, from: sender }, this.config.ownerId, this.config.chatId)) return;
     const controlReply = text => this.send(text, null, { chat_id: message.chat.id,
       ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }) });
+    if (update.message && message.message_thread_id != null) {
+      const threadId = destination(message, this.state);
+      if (this.creatingTopics.has(threadId)) await this.creatingTopics.get(threadId);
+      if (this.state.ignoredPrompts[message.chat.id + ':' + message.message_id]) return;
+      const pending = this.state.historyPending[message.chat.id + ':' + message.message_thread_id];
+      if (pending != null && pending === message.text) {
+        return controlReply('Tin này khớp prompt lịch sử có kết quả gửi chưa xác định. Bot không chạy lại; kiểm tra lịch sử topic trước.');
+      }
+    }
     if (update.callback_query) {
       const id = update.callback_query.data || '';
       if (id.startsWith('project:') || id.startsWith('newchat:')) {
@@ -435,9 +509,10 @@ export class Bridge {
           cursor = result.page?.nextCursor;
         } while (prior && cursor && !turns.some(t => t.id === prior.turnId));
         const all = events(turns);
-        const seen = new Set(prior?.keys || []);
         // First discovery is a baseline; don't dump historical conversations.
         if (prior) {
+          if (this.state.topicMode && all.some(event => !prior.keys.includes(event.key))) await this.topic(id);
+          const seen = new Set(prior.keys);
           for (const event of all) {
             if (seen.has(event.key)) continue;
             await this.send(event.text, id);
@@ -540,7 +615,17 @@ async function main() {
     }
   }
   if (!Number.isSafeInteger(config.ownerId) || config.ownerId <= 0) throw new Error('ownerId không hợp lệ.');
-  const bridge = new Bridge(config, state, call, tg, () => saveJson(stateFile, state));
+  const userFile = path.join(LOCAL, 'user-session.json');
+  let personal;
+  if (fs.existsSync(userFile) && JSON.parse(fs.readFileSync(userFile, 'utf8')).session) {
+    const { openPersonal } = await import('./telegram_user.mjs');
+    try { personal = await openPersonal(config.ownerId, config.chatId); }
+    catch (error) {
+      console.error('Phiên cá nhân:', error.message);
+      personal = { send: async () => { throw error; } };
+    }
+  }
+  const bridge = new Bridge(config, state, call, tg, () => saveJson(stateFile, state), undefined, personal?.send);
   if (state.pending) {
     await bridge.send('Bot đã dừng khi đang gửi prompt hoặc tạo chat. Kết quả chưa xác định; kiểm tra App trước khi thử lại.', state.pending.threadId);
     delete state.pending;
