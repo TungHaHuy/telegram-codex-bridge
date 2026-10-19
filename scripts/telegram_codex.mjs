@@ -70,6 +70,62 @@ export async function appCall(callerThreadId, tool, args) {
   try { return JSON.parse(text); } catch { return { message: text }; }
 }
 
+// Desktop's existing local coordination pipe. No second Codex runtime or listener.
+export function desktopRequest(method, params, version, targetClientId, endpoint = '\\\\.\\pipe\\codex-ipc') {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(endpoint);
+    let data = Buffer.alloc(0), clientId = 'initializing-client', requestId;
+    const timer = setTimeout(() => finish(new Error('Codex Desktop IPC timeout; kết quả chưa xác định.')), 15000);
+    function finish(error, result) {
+      clearTimeout(timer); socket.destroy();
+      error ? reject(error) : resolve(result);
+    }
+    function send(name, args, revision, target) {
+      requestId = crypto.randomUUID();
+      const body = Buffer.from(JSON.stringify({ type: 'request', requestId, sourceClientId: clientId,
+        method: name, params: args, version: revision, targetClientId: target, timeoutMs: 10000 }));
+      const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
+      socket.write(Buffer.concat([header, body]));
+    }
+    socket.once('error', error => finish(error));
+    socket.once('end', () => finish(new Error('Codex Desktop IPC đóng kết nối.')));
+    socket.once('connect', () => send('initialize', { clientType: 'telegram-codex' }, 0));
+    socket.on('data', chunk => {
+      data = Buffer.concat([data, chunk]);
+      try {
+        while (data.length >= 4) {
+          const size = data.readUInt32LE(0);
+          if (size > MAX_FRAME) throw new Error('Codex Desktop IPC frame quá lớn.');
+          if (data.length < size + 4) break;
+          const message = JSON.parse(data.subarray(4, size + 4).toString('utf8'));
+          data = data.subarray(size + 4);
+          if (message.type === 'client-discovery-request') {
+            const body = Buffer.from(JSON.stringify({ type: 'client-discovery-response', requestId: message.requestId,
+              response: { canHandle: false } }));
+            const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
+            socket.write(Buffer.concat([header, body]));
+          }
+          if (message.type !== 'response' || message.requestId !== requestId) continue;
+          if (message.resultType !== 'success') throw new Error(message.error || 'Codex Desktop từ chối thao tác.');
+          if (clientId === 'initializing-client') {
+            clientId = message.result.clientId;
+            send(method, params, version, targetClientId);
+          } else return finish(null, message);
+        }
+      } catch (error) { finish(error); }
+    });
+  });
+}
+
+export async function interruptChat(threadId, turnId) {
+  const owner = await desktopRequest('thread-owner-discovery', { hostId: 'local', conversationId: threadId }, 1);
+  const response = await desktopRequest('thread-follower-interrupt-turn', {
+    conversationId: threadId, mode: 'user-stop', expectedTurnId: turnId,
+  }, 4, owner.handledByClientId);
+  if (!response.result?.ok) throw new Error('Codex chưa xác nhận dừng chat.');
+  return response.result;
+}
+
 export function localThreads(result) {
   return [...new Map([...result.pinnedThreads, ...result.threads]
     .filter(t => t.kind === 'codex' && t.hostId === 'local').map(t => [t.id, t])).values()];
@@ -199,8 +255,31 @@ export function historyPair(turn) {
   return prompts.length && replies.length ? { turn, prompt: prompts.join('\n\n'), response: replies.join('\n\n') } : null;
 }
 
+export function conversationEvents(turns) {
+  const result = [];
+  for (const turn of [...turns].reverse()) {
+    const items = turn.items || [];
+    for (const [index, item] of items.entries()) {
+      const key = item.id || turn.id + ':item:' + index;
+      if (item.type === 'userMessage') {
+        const text = (item.content || []).map(p => p.type === 'text' ? p.text : '[Ảnh]').join('\n');
+        if (text.trim()) result.push({ key, text, role: 'user', turnId: turn.id });
+      } else if (item.type === 'functionCallOutput' && item.namespace === 'codex_app' &&
+          ['create_thread', 'send_message_to_thread'].includes(item.name)) {
+        const match = item.output?.text?.match(/^<codex_delegation>\s*<source_thread_id>([^<]+)<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/);
+        if (match) result.push({ key, text: match[2], role: 'user', caller: match[1], turnId: turn.id });
+      } else if (item.type === 'agentMessage' && item.text &&
+          !(turn.status === 'inProgress' && index === items.length - 1)) {
+        result.push({ key, text: item.text, role: 'assistant', turnId: turn.id });
+      }
+    }
+    if (turn.error) result.push({ key: turn.id + ':error', text: 'Lỗi Codex: ' + JSON.stringify(turn.error), role: 'assistant', turnId: turn.id });
+  }
+  return result;
+}
+
 export class Bridge {
-  constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal) {
+  constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal, interrupt = interruptChat) {
     this.config = config;
     this.state = state;
     this.call = call;
@@ -208,17 +287,27 @@ export class Bridge {
     this.persist = persist;
     this.receiveImage = receiveImage;
     this.sendPersonal = sendPersonal;
+    this.interrupt = interrupt;
     this.readErrors = new Map();
     this.creatingTopics = new Map();
+    this.syncing = new Map();
     this.state.topics ||= {};
     this.state.projects ||= {};
     this.state.newChats ||= {};
     this.state.ignoredPrompts ||= {};
     this.state.historyPending ||= {};
+    // Old auto-created topics are dormant until selected or used again.
+    this.state.enabled ||= this.state.selected ? { [this.state.selected]: true } : {};
+    this.state.delivered ||= {};
+    this.state.manual ||= {};
+    this.state.telegramPrompts ||= {};
+    this.state.sources ||= {};
+    this.state.attention ||= {};
     this.creatingChat = false;
   }
 
   async topic(threadId) {
+    if (!this.state.enabled[threadId]) throw new Error('Chat chưa được chọn trên Telegram.');
     if (!this.creatingTopics.has(threadId) && this.state.topics[threadId]) return this.state.topics[threadId];
     if (!this.creatingTopics.has(threadId)) {
       const creating = (async () => {
@@ -228,11 +317,6 @@ export class Bridge {
         });
         this.state.topics[threadId] = topic.message_thread_id;
         this.persist();
-        try { await this.history(threadId, topic.message_thread_id); }
-        catch (error) {
-          await this.send('Topic đã tạo, nhưng chưa kéo đủ lịch sử: ' + error.message, null,
-            { message_thread_id: topic.message_thread_id });
-        }
         return topic.message_thread_id;
       })();
       this.creatingTopics.set(threadId, creating);
@@ -241,41 +325,71 @@ export class Bridge {
     finally { this.creatingTopics.delete(threadId); }
   }
 
-  async history(threadId, topicId) {
-    const pairs = [];
+  sourcedEvents(threadId, turns) {
+    const seen = new Set(this.state.seen[threadId]?.keys || []);
+    const pending = this.state.telegramPrompts[threadId] ||= [];
+    let origin = 'desktop', turnId;
+    return conversationEvents(turns).map(event => {
+      if (event.turnId !== turnId) { origin = 'desktop'; turnId = event.turnId; }
+      if (event.role === 'user') {
+        if (!this.state.sources[event.key] && !seen.has(event.key) && event.caller === this.config.callerThreadId) {
+          const index = pending.indexOf(event.text);
+          if (index >= 0) { pending.splice(index, 1); this.state.sources[event.key] = 'telegram'; }
+        }
+        origin = this.state.sources[event.key] || 'desktop';
+      }
+      return { ...event, origin };
+    });
+  }
+
+  async deliver(threadId, event) {
+    const delivered = this.state.delivered[threadId] ||= [];
+    if (delivered.includes(event.key)) return;
+    if (event.role === 'user' && event.origin === 'telegram') {
+      // The original Telegram prompt is already visible in the topic.
+    } else if (event.role === 'user' && this.sendPersonal && this.state.topicMode) {
+      const topicId = await this.topic(threadId);
+      for (const part of chunks(event.text)) {
+        const pendingKey = this.config.chatId + ':' + topicId;
+        this.state.historyPending[pendingKey] = part;
+        this.persist();
+        const sent = await this.sendPersonal(part, topicId);
+        this.state.ignoredPrompts[this.config.chatId + ':' + sent.id] = true;
+        delete this.state.historyPending[pendingKey];
+        this.persist();
+      }
+    } else await this.send((event.role === 'user' ? 'Bạn:\n' : '') + event.text, threadId);
+    delivered.push(event.key);
+    this.persist();
+  }
+
+  async update(threadId) {
+    if (!this.syncing.has(threadId)) this.syncing.set(threadId, this.pullUpdate(threadId));
+    try { return await this.syncing.get(threadId); }
+    finally { this.syncing.delete(threadId); }
+  }
+
+  async pullUpdate(threadId) {
+    const prior = this.state.manual[threadId];
+    const turns = [];
     let cursor;
     do {
       const result = await this.call('read_thread', {
         threadId, hostId: 'local', turnLimit: 1, includeOutputs: true,
         maxOutputCharsPerItem: 20000, ...(cursor ? { cursor } : {}),
       });
-      for (const turn of result.turns || []) {
-        const pair = historyPair(turn);
-        if (pair) pairs.push(pair);
-      }
+      turns.push(...(result.turns || []));
       cursor = result.page?.nextCursor;
-    } while (pairs.length < 5 && cursor);
-    const recent = pairs.slice(0, 5).reverse();
-    if (!recent.length) return;
-    const destination = { message_thread_id: topicId };
-    await this.send('Lịch sử: ' + recent.length + ' cặp prompt–response gần nhất (từ cũ đến mới).', null, destination);
-    for (const pair of recent) {
-      if (this.sendPersonal) {
-        for (const part of chunks(pair.prompt)) {
-          const pendingKey = this.config.chatId + ':' + topicId;
-          this.state.historyPending[pendingKey] = part;
-          this.persist();
-          const sent = await this.sendPersonal(part, topicId);
-          this.state.ignoredPrompts[this.config.chatId + ':' + sent.id] = true;
-          delete this.state.historyPending[pendingKey];
-          this.persist();
-        }
-      } else await this.send('Bạn:\n' + pair.prompt, null, destination);
-      await this.send((this.sendPersonal ? '' : 'Codex:\n') + pair.response, null, destination);
+    } while (cursor && (prior ? !turns.some(t => t.id === prior.turnId) : turns.filter(t => t.status !== 'inProgress').length < 5));
+    let count = 0;
+    for (const event of this.sourcedEvents(threadId, turns)) {
+      if (event.origin === 'telegram' || this.state.delivered[threadId]?.includes(event.key)) continue;
+      await this.deliver(threadId, event);
+      count++;
     }
-    const prior = this.state.seen[threadId];
-    if (prior) prior.keys = [...new Set([...prior.keys, ...events(recent.map(pair => pair.turn)).map(event => event.key)])];
+    this.state.manual[threadId] = { turnId: turns[0]?.id };
     this.persist();
+    if (!count) await this.send('Chưa có tin mới từ prompt trên desktop.', threadId);
   }
 
   async send(text, threadId, extra = {}) {
@@ -336,6 +450,8 @@ export class Bridge {
       // Register before the first scan, including replies that finish immediately.
       this.state.seen[id] = { keys: [], wasActive: true };
       this.state.selected = id;
+      this.state.enabled[id] = true;
+      (this.state.telegramPrompts[id] ||= []).push(prompt);
       this.state.pending.threadId = id;
       this.persist();
       await this.send('Đã tạo chat mới trong project ' + project.label +
@@ -359,6 +475,7 @@ export class Bridge {
     if (update.message && message.message_thread_id != null) {
       const threadId = destination(message, this.state);
       if (this.creatingTopics.has(threadId)) await this.creatingTopics.get(threadId);
+      if (this.syncing.has(threadId)) await this.syncing.get(threadId);
       if (this.state.ignoredPrompts[message.chat.id + ':' + message.message_id]) return;
       const pending = this.state.historyPending[message.chat.id + ':' + message.message_thread_id];
       if (pending != null && pending === message.text) {
@@ -384,6 +501,7 @@ export class Bridge {
       if (!this.state.threads[id]) return;
       delete this.state.newChats[menuContext(message)];
       this.state.selected = id;
+      this.state.enabled[id] = true;
       this.persist();
       await this.telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id });
       await this.send(this.state.topicMode ?
@@ -407,9 +525,23 @@ export class Bridge {
         JSON.stringify(imagePath) + '\nHãy mở ảnh này bằng công cụ view_image trước khi trả lời.';
     };
     if (command === '/cancel') {
-      delete this.state.newChats[menuContext(message)];
+      if (this.state.newChats[menuContext(message)]) {
+        delete this.state.newChats[menuContext(message)];
+        this.persist();
+        return controlReply('Đã hủy tạo chat mới.');
+      }
+      const id = destination(message, this.state);
+      if (!this.state.threads[id]) return controlReply('Mở đúng topic của chat cần dừng, rồi gửi /cancel.');
+      this.state.enabled[id] = true;
       this.persist();
-      return controlReply('Đã hủy tạo chat mới.');
+      try {
+        const result = await this.call('read_thread', { threadId: id, hostId: 'local', turnLimit: 1 });
+        const active = result.turns?.find(turn => turn.status === 'inProgress');
+        if (!active) return controlReply('Chat hiện không có lượt đang chạy.');
+        const stopped = await this.interrupt(id, active.id);
+        return controlReply(stopped.interruptedTurnId ? 'Đã dừng lượt đang chạy.' +
+          (stopped.goalPauseError ? '\nChưa tạm dừng được goal: ' + stopped.goalPauseError : '') : 'Lượt đó đã kết thúc.');
+      } catch (error) { return controlReply('Chưa xác nhận dừng chat: ' + error.message + ' Kiểm tra Codex trước khi thử lại.'); }
     }
     if (command === '/quota') {
       try { return await controlReply(quotaText(await this.call('get_usage_limits', {}))); }
@@ -432,8 +564,7 @@ export class Bridge {
       return;
     }
     if (command === '/start' || command === '/help') {
-      if (this.state.topicMode) return controlReply('/projects — chọn project, mở chat gần đây hoặc New chat\n/chats — mở chat có sẵn\nMỗi topic nối với một chat. Nhắn trong topic để gửi prompt; đang chạy thì steer.\n/status — trạng thái chat của topic này\n/quota — hạn mức Codex và thời điểm reset\n/cancel — hủy tạo chat mới.');
-      return this.send('/projects — chọn project, mở hoặc tạo chat\n/chats — chọn chat\nReply tin của bot — gửi vào chat đó\nTin thường — gửi vào chat đã chọn\n/status — xem chat đang chọn\n/quota — hạn mức Codex và thời điểm reset\n/cancel — hủy tạo chat mới\nNếu Codex đang chạy, prompt được gửi ngay qua Codex App.');
+      return controlReply('/projects — chọn project, mở chat gần đây hoặc New chat\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin mới từ prompt trên desktop (lần đầu tối đa 5 lượt gần nhất)\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: bot báo ngay; duyệt trong Codex App.');
     }
     if (command === '/chats') {
       const threads = await this.chats();
@@ -449,7 +580,7 @@ export class Bridge {
       return;
     }
     const newProjectId = this.state.newChats[menuContext(message)];
-    if (newProjectId && command !== '/status') {
+    if (newProjectId && !['/status', '/update'].includes(command)) {
       try { text = await prompt(); }
       catch (error) { return controlReply('Chưa gửi ảnh vào Codex: ' + error.message + ' Gửi lại ảnh để thử lại.'); }
       // Consume intent before dispatch, so an uncertain creation is never replayed.
@@ -465,6 +596,12 @@ export class Bridge {
     if (!thread) return controlReply(this.state.topicMode ?
       'Mở topic của chat cần nhắn. Dùng /chats để tạo topic cho chat có sẵn.' :
       'Chưa xác định được chat. Dùng /chats hoặc Reply đúng tin của bot.');
+    this.state.enabled[id] = true;
+    this.persist();
+    if (command === '/update') {
+      try { return await this.update(id); }
+      catch (error) { return controlReply('Chưa cập nhật đủ tin từ desktop: ' + error.message); }
+    }
     if (command === '/status') {
       const result = await this.call('read_thread', { threadId: id, hostId: 'local', turnLimit: 1 });
       return this.send(JSON.stringify(result.thread.status), id);
@@ -473,6 +610,7 @@ export class Bridge {
     catch (error) { return controlReply('Chưa gửi ảnh vào Codex: ' + error.message + ' Gửi lại ảnh để thử lại.'); }
     // Persist intent before dispatch. Never replay an uncertain prompt on restart.
     this.state.pending = { updateId: update.update_id, threadId: id };
+    (this.state.telegramPrompts[id] ||= []).push(text);
     this.persist();
     try {
       const result = await this.call('send_message_to_thread', { threadId: id, hostId: 'local', prompt: text });
@@ -486,44 +624,39 @@ export class Bridge {
   }
 
   async scan() {
-    const threads = await this.chats();
-    // Include explicitly selected chats even if they fall outside the recent 50.
-    const ids = new Set([...threads.map(t => t.id), ...Object.values(this.state.routes)]);
-    if (this.state.selected) ids.add(this.state.selected);
-    for (const id of ids) {
+    // Selection is explicit. Neither recent desktop chats nor old routes opt in.
+    for (const id of Object.keys(this.state.enabled).filter(id => this.state.enabled[id])) {
       const thread = this.state.threads[id];
       if (!thread) continue;
-      if (!this.state.seen[id] && this.creatingChat) continue;
       try {
         const prior = this.state.seen[id];
-        if (prior && prior.updatedAt === thread.updatedAt && !prior.wasActive && !['active', 'running'].includes(thread.status)) continue;
         const turns = [];
-        let cursor;
+        let cursor, status;
         // Walk back to the last observed turn, so fast consecutive turns aren't lost.
         do {
           const result = await this.call('read_thread', {
-            threadId: id, hostId: 'local', turnLimit: 1, includeOutputs: false,
+            threadId: id, hostId: 'local', turnLimit: 1, includeOutputs: true,
             maxOutputCharsPerItem: 20000, ...(cursor ? { cursor } : {}),
           });
-          turns.push(...result.turns);
+          status ||= result.thread?.status;
+          turns.push(...(result.turns || []));
           cursor = result.page?.nextCursor;
         } while (prior && cursor && !turns.some(t => t.id === prior.turnId));
-        const all = events(turns);
-        // First discovery is a baseline; don't dump historical conversations.
-        if (prior) {
-          if (this.state.topicMode && all.some(event => !prior.keys.includes(event.key))) await this.topic(id);
-          const seen = new Set(prior.keys);
-          for (const event of all) {
-            if (seen.has(event.key)) continue;
-            await this.send(event.text, id);
-            seen.add(event.key);
-            prior.keys = [...seen];
-            this.persist();
-          }
+        const flags = status?.activeFlags || [];
+        const waiting = flags.filter(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag));
+        const attention = waiting.length ? turns[0]?.id + ':' + waiting.join(',') : '';
+        if (attention && this.state.attention[id] !== attention) {
+          await this.send(waiting.includes('waitingOnApproval') ?
+            '⚠️ Codex đang chờ bạn cấp quyền. Mở chat này trong Codex App để xem và duyệt yêu cầu. /cancel để dừng lượt này.' :
+            '⚠️ Codex đang chờ bạn trả lời câu hỏi trong App. /update để xem tin mới; /cancel để dừng.', id);
+        }
+        this.state.attention[id] = attention;
+        const all = this.sourcedEvents(id, turns);
+        for (const event of all) {
+          if (event.origin === 'telegram') await this.deliver(id, event);
         }
         this.state.seen[id] = {
-          updatedAt: thread.updatedAt, turnId: turns[0]?.id,
-          wasActive: ['active', 'running'].includes(thread.status),
+          turnId: turns[0]?.id,
           keys: all.map(event => event.key),
         };
         this.persist();
@@ -591,6 +724,15 @@ async function main() {
   const tg = (method, body) => telegram(config.token, method, body);
   const me = await tg('getMe', {});
   config.botUsername = me.username;
+  await tg('setMyCommands', { commands: [
+    { command: 'projects', description: 'Chọn project, mở hoặc tạo chat' },
+    { command: 'chats', description: 'Chọn chat có sẵn' },
+    { command: 'update', description: 'Lấy tin mới từ prompt trên desktop' },
+    { command: 'cancel', description: 'Dừng lượt đang chạy hoặc hủy New chat' },
+    { command: 'status', description: 'Trạng thái chat trong topic' },
+    { command: 'quota', description: 'Hạn mức Codex và giờ reset' },
+    { command: 'help', description: 'Hướng dẫn sử dụng' },
+  ] });
   const webhook = await tg('getWebhookInfo', {});
   if (webhook.url) throw new Error('Bot đang có webhook. Dùng bot Telegram riêng để tránh tranh update.');
   const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) :
@@ -632,7 +774,7 @@ async function main() {
     bridge.persist();
   }
   await bridge.scan();
-  await bridge.send('Đã kết nối Codex trên máy. /chats để chọn cuộc trò chuyện.');
+  await bridge.send('Đã kết nối Codex. /projects để chọn chat. Prompt Telegram nhận phản hồi tự động; /update lấy tin từ desktop. /cancel dừng lượt đang chạy.');
   console.log('Bot đang chạy. Ctrl+C để dừng.');
   // Independent loops: a slow Codex read must not block incoming steering.
   void (async () => {

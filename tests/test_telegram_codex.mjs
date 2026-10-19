@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, localProjects, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, localProjects, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
@@ -66,39 +66,130 @@ await new Promise(resolve => server.listen(endpoint, resolve));
 try { assert.deepEqual(await pipeRequest(endpoint, 'tools/list', {}), { text: 'đã nối 😀' }); }
 finally { await new Promise(resolve => server.close(resolve)); }
 
-// Baseline skips old replies; a completed new reply is forwarded once, verbatim.
-const t = { id: 'A', kind: 'codex', hostId: 'local', status: 'active', title: 'Chat A', updatedAt: 1 };
-let turns = [{ id: 'turn-1', status: 'completed', items: [{ type: 'agentMessage', id: 'old', text: 'old' }] }];
-const scanState = { routes: {}, threads: {}, seen: {} };
-const outgoing = [];
-const scanner = new Bridge({ ownerId: owner }, scanState, async (tool) => {
-  if (tool === 'list_threads') return { pinnedThreads: [], threads: [t] };
-  return { turns, page: {} };
-}, async (method, args) => { outgoing.push(args.text); return { message_id: outgoing.length }; }, () => {});
-await scanner.scan(); assert.equal(outgoing.length, 0);
-turns = [{ id: 'turn-2', status: 'completed', error: { message: 'quota' }, items: [{ type: 'agentMessage', id: 'new', text: long }] }, ...turns];
-await scanner.scan();
-assert(outgoing.join('').includes('Lỗi Codex'));
-assert(outgoing[0].startsWith('[Chat A]\n'), 'legacy chats retain the routing label');
-const count = outgoing.length;
-await scanner.scan(); assert.equal(outgoing.length, count);
-// An idle transition can share the same timestamp as the active snapshot.
-t.status = 'notLoaded';
-turns[0].items.push({ type: 'agentMessage', id: 'final', text: 'same timestamp final' });
-await scanner.scan(); assert(outgoing.at(-1).includes('same timestamp final'));
+// Desktop IPC initializes before an exact-turn interrupt; unrelated broadcasts are ignored.
+const ipcServer = net.createServer(socket => {
+  let input = Buffer.alloc(0);
+  socket.on('data', chunk => {
+    input = Buffer.concat([input, chunk]);
+    while (input.length >= 4 && input.length >= input.readUInt32LE(0) + 4) {
+      const length = input.readUInt32LE(0);
+      const request = JSON.parse(input.subarray(4, length + 4)); input = input.subarray(length + 4);
+      if (request.method === 'initialize') assert.equal(request.sourceClientId, 'initializing-client');
+      else {
+        assert.equal(request.sourceClientId, 'client-test');
+        assert.equal(request.method, 'thread-follower-interrupt-turn');
+        assert.equal(request.version, 4);
+        assert.equal(request.targetClientId, 'owner-test');
+        assert.deepEqual(request.params, { conversationId: 'A', mode: 'user-stop', expectedTurnId: 'turn-test' });
+      }
+      const messages = [{ type: 'broadcast', method: 'irrelevant' }, { type: 'response', requestId: request.requestId,
+        method: request.method, resultType: 'success', result: request.method === 'initialize' ?
+          { clientId: 'client-test' } : { ok: true, interruptedTurnId: 'turn-test' } }];
+      for (const message of messages) {
+        const body = Buffer.from(JSON.stringify(message)), header = Buffer.alloc(4); header.writeUInt32LE(body.length);
+        socket.write(Buffer.concat([header, body]));
+      }
+    }
+  });
+});
+await new Promise(resolve => ipcServer.listen(endpoint, resolve));
+try {
+  const result = await desktopRequest('thread-follower-interrupt-turn',
+    { conversationId: 'A', mode: 'user-stop', expectedTurnId: 'turn-test' }, 4, 'owner-test', endpoint);
+  assert.equal(result.result.interruptedTurnId, 'turn-test');
+} finally { await new Promise(resolve => ipcServer.close(resolve)); }
 
-// A broken history must not block independently readable chats.
-const other = { ...t, id: 'C', title: 'Chat C' };
-const isolated = new Bridge({ ownerId: owner }, { routes: {}, threads: {}, seen: {} }, async (tool, args) => {
-  if (tool === 'list_threads') return { pinnedThreads: [], threads: [t, other] };
-  if (args.threadId === 'A') throw new Error('history limit');
-  return { turns: [], page: {} };
-}, async () => ({ message_id: 999 }), () => {});
-await isolated.scan(); assert(isolated.state.seen.C);
+// Only selected chats are scanned. Desktop output waits for /update.
+const t = { id: 'A', kind: 'codex', hostId: 'local', status: 'active', title: 'Chat A', updatedAt: 1 };
+const desktopTurn = (id, text, status = 'completed') => ({ id, status, items: [
+  { type: 'userMessage', id: id + '-prompt', content: [{ type: 'text', text: 'desktop ' + id }] },
+  { type: 'agentMessage', id: id + '-reply', text },
+] });
+let turns = [desktopTurn('one', 'desktop response one')], flags = [];
+const scanState = { routes: { old: 'UNSELECTED' }, selected: 'A', topics: { UNSELECTED: 99 },
+  threads: { A: t, UNSELECTED: { title: 'Unselected' }, C: { title: 'C' } }, seen: {} };
+const outgoing = [], scanReads = [], cancelCalls = [];
+const scanner = new Bridge({ ownerId: owner, callerThreadId: 'bridge' }, scanState, async (tool, args) => {
+  if (tool === 'send_message_to_thread') return {};
+  assert.equal(tool, 'read_thread'); scanReads.push(args.threadId);
+  if (args.threadId === 'C') return { turns: [], page: {}, thread: { status: {} } };
+  assert.equal(args.threadId, 'A', 'recent chats and old auto-created topics must stay dormant');
+  if (args.cursor) return { turns: [], page: {} };
+  return { turns, page: {}, thread: { status: { type: 'active', activeFlags: flags } } };
+}, async (method, args) => { outgoing.push(args); return { message_id: outgoing.length }; }, () => {},
+undefined, undefined, async (id, turnId) => { cancelCalls.push({ id, turnId }); return { interruptedTurnId: turnId }; });
+await scanner.scan(); assert.equal(outgoing.length, 0);
+turns.unshift(desktopTurn('two', 'desktop response two'));
+await scanner.scan(); assert.equal(outgoing.length, 0);
+await scanner.handle({ message: { ...msg, text: '/update' } });
+assert(outgoing.some(m => m.text.includes('desktop response two')));
+const count = outgoing.filter(m => m.text.includes('desktop response')).length;
+await scanner.handle({ message: { ...msg, text: '/update' } });
+assert.equal(outgoing.filter(m => m.text.includes('desktop response')).length, count, 'manual sync must not duplicate');
+const delegatedTurn = (id, prompt, reply, caller = 'bridge') => ({ id, status: 'completed', items: [
+  { type: 'functionCallOutput', id: id + '-prompt', namespace: 'codex_app', name: 'send_message_to_thread',
+    output: { text: '<codex_delegation>\n<source_thread_id>' + caller + '</source_thread_id>\n<input>' + prompt + '</input>\n</codex_delegation>' } },
+  { type: 'agentMessage', id: id + '-reply', text: reply },
+] });
+await scanner.handle({ message: { ...msg, text: 'telegram request' } });
+turns.unshift(delegatedTurn('tele', 'telegram request', 'TELEGRAM_AUTO_OK'));
+await scanner.scan(); await scanner.scan();
+assert.equal(outgoing.filter(m => m.text.includes('TELEGRAM_AUTO_OK')).length, 1);
+// A Telegram response still streaming must wait, then finish once, also after restart.
+await scanner.handle({ message: { ...msg, text: 'stream request' } });
+const streaming = delegatedTurn('stream', 'stream request', 'STREAM_FINAL_OK');
+streaming.status = 'inProgress'; turns.unshift(streaming);
+await scanner.scan();
+assert(!outgoing.some(m => m.text.includes('STREAM_FINAL_OK')));
+streaming.status = 'completed'; await scanner.scan();
+assert.equal(outgoing.filter(m => m.text.includes('STREAM_FINAL_OK')).length, 1);
+const restarted = new Bridge(scanner.config, JSON.parse(JSON.stringify(scanState)), scanner.call,
+  scanner.telegram, () => {});
+await restarted.scan();
+assert.equal(outgoing.filter(m => m.text.includes('STREAM_FINAL_OK')).length, 1);
+const afterAuto = outgoing.length;
+await scanner.handle({ message: { ...msg, text: '/update' } });
+assert.equal(outgoing.filter(m => m.text.includes('TELEGRAM_AUTO_OK')).length, 1);
+assert(!outgoing.slice(afterAuto).some(m => m.text.includes('telegram request')), 'original Telegram prompt is already visible');
+// Steer changes the source only from that prompt onward, within the same turn.
+await scanner.handle({ message: { ...msg, text: 'steer' } });
+const mixed = desktopTurn('mixed', 'DESKTOP_BEFORE_STEER');
+mixed.items.push(...delegatedTurn('mixed-steer', 'steer', 'TELEGRAM_AFTER_STEER').items);
+turns.unshift(mixed);
+await scanner.scan();
+assert(!outgoing.some(m => m.text.includes('DESKTOP_BEFORE_STEER')));
+assert(outgoing.some(m => m.text.includes('TELEGRAM_AFTER_STEER')));
+await scanner.update('A');
+assert(outgoing.some(m => m.text.includes('DESKTOP_BEFORE_STEER')));
+assert.equal(outgoing.filter(m => m.text.includes('TELEGRAM_AFTER_STEER')).length, 1);
+// Pending approvals notify without /update, once per waiting episode.
+flags = ['waitingOnApproval'];
+await scanner.scan(); await scanner.scan();
+assert.equal(outgoing.filter(m => m.text.includes('đang chờ bạn cấp quyền')).length, 1);
+flags = []; await scanner.scan(); flags = ['waitingOnApproval']; await scanner.scan();
+assert.equal(outgoing.filter(m => m.text.includes('đang chờ bạn cấp quyền')).length, 2);
+assert(scanReads.every(id => id !== 'UNSELECTED'));
+await assert.rejects(scanner.topic('UNSELECTED'), /chưa được chọn/);
+// /cancel interrupts the actual active turn, never sends a stop prompt.
+turns[0].status = 'inProgress';
+await scanner.handle({ message: { ...msg, text: '/cancel' } });
+assert.deepEqual(cancelCalls, [{ id: 'A', turnId: 'mixed' }]);
+scanState.newChats[owner + ':0'] = 'P';
+await scanner.handle({ message: { ...msg, text: '/cancel' } });
+assert.equal(cancelCalls.length, 1, 'cancel wizard before stopping an unrelated chat');
+turns[0].status = 'completed';
+await scanner.handle({ message: { ...msg, text: '/cancel' } });
+assert.equal(cancelCalls.length, 1);
+scanner.state.enabled.C = true;
+const normalCall = scanner.call;
+scanner.call = async (tool, args) => { if (args.threadId === 'A') throw new Error('history limit'); return normalCall(tool, args); };
+await scanner.scan(); assert(scanner.state.seen.C, 'a broken chat must not block the other selected chat');
+await scanner.handle({ message: { ...msg, text: '/update' } });
+assert(outgoing.at(-1).text.includes('Chưa cập nhật đủ tin từ desktop: history limit'));
 
 // Topics are the routing authority, including when a reply or selection disagrees.
 const topicState = {
-  topicMode: true, topics: { A: 101, B: 202 }, routes: { 7: 'B' }, selected: 'B',
+  enabled: { A: true, B: true }, topicMode: true, topics: { A: 101, B: 202 }, routes: { 7: 'B' }, selected: 'B',
   threads: { A: { title: 'Chat A' }, B: { title: 'Chat B' } }, seen: {},
 };
 assert.equal(destination({ message_thread_id: 101, reply_to_message: { message_id: 7 } }, topicState), 'A');
@@ -157,7 +248,7 @@ assert.equal(historyPair({ ...delegated, items: [{ ...delegated.items[0], name: 
 
 const historyTurns = [{ ...historyTurn(8), status: 'inProgress' },
   ...Array.from({ length: 7 }, (_, i) => historyTurn(7 - i))];
-const historyState = { topicMode: true, topics: {}, routes: {}, threads: { A: { ...t } },
+const historyState = { enabled: { A: true }, topicMode: true, topics: {}, routes: {}, threads: { A: { ...t } },
   seen: { A: { keys: [], turnId: 'history-7', updatedAt: 0 } } };
 const historyCalls = [], historyMessages = [];
 const historyBridge = new Bridge({ ownerId: owner }, historyState, async (tool, args) => {
@@ -172,36 +263,21 @@ const historyBridge = new Bridge({ ownerId: owner }, historyState, async (tool, 
   historyMessages.push({ method, args });
   return method === 'createForumTopic' ? { message_thread_id: 505 } : { message_id: historyMessages.length };
 }, () => {});
-await Promise.all([historyBridge.send('live first', 'A'), historyBridge.send('live second', 'A')]);
+await Promise.all([historyBridge.send('connected', 'A'), historyBridge.send('connected again', 'A')]);
 assert.equal(historyMessages.filter(m => m.method === 'createForumTopic').length, 1);
-assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 6, 'skip unfinished turn, stop after five pairs');
+assert.equal(historyCalls.length, 0, 'opening a topic must not import desktop history');
+await historyBridge.update('A');
+assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 6);
 const imported = historyMessages.filter(m => m.method === 'sendMessage').map(m => m.args.text);
-assert(imported[0].startsWith('Lịch sử: 5 cặp'));
-assert.deepEqual(imported.slice(1, 11), [3,4,5,6,7].flatMap(n => ['Bạn:\nprompt ' + n, 'Codex:\nresponse ' + n]));
-assert.deepEqual(new Set(imported.slice(11)), new Set(['live first', 'live second']), 'concurrent live sends wait for history');
-assert(historyMessages.filter(m => m.method === 'sendMessage').every(m => m.args.message_thread_id === 505));
-assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG') && !imported.includes('working'));
-const historyCount = historyCalls.length;
-await historyBridge.topic('A');
-assert.equal(historyCalls.length, historyCount, 'existing topics must not reimport history');
+assert.deepEqual(imported.filter(text => /^response/.test(text)), [3,4,5,6,7].map(n => 'response ' + n));
+assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG'));
+const historyCount = historyMessages.length;
 await historyBridge.scan();
-assert(!historyMessages.some(m => m.args.text === 'response 7'), 'imported answer must not also be sent by scanner');
-
-const emptyHistoryMessages = [];
-let emptyHistoryFails = false;
-const emptyHistory = new Bridge({ ownerId: owner }, { topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' }, B: { title: 'B' } }, seen: {} },
-  async () => { if (emptyHistoryFails) throw new Error('history unavailable'); return { turns: [], page: {} }; },
-  async (method, args) => { emptyHistoryMessages.push({ method, args }); return { message_thread_id: 606, message_id: emptyHistoryMessages.length }; }, () => {});
-await emptyHistory.send('new chat', 'A');
-assert.equal(emptyHistoryMessages.filter(m => m.method === 'sendMessage').length, 1, 'empty chat has no invented pairs');
-emptyHistoryFails = true;
-await emptyHistory.send('live', 'B');
-assert(emptyHistoryMessages.some(m => m.args.text?.includes('chưa kéo đủ lịch sử: history unavailable')));
-assert.equal(emptyHistoryMessages.at(-1).args.text, 'live', 'history failure must not block live messages');
+assert.equal(historyMessages.length, historyCount, 'desktop responses must not auto-forward after manual sync');
 
 // Personal-account history keeps the sender roles and never re-executes old prompts.
 const roleMessages = [], replayUpdates = [], roleCalls = [];
-const roleState = { topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' } }, seen: {} };
+const roleState = { enabled: { A: true }, topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' } }, seen: {} };
 let roleBridge, personalId = 9000;
 roleBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, roleState, async (tool, args) => {
   roleCalls.push({ tool, args });
@@ -219,6 +295,7 @@ roleBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, roleState, async (
   return { id };
 });
 await roleBridge.send('connected', 'A');
+await roleBridge.update('A');
 await Promise.all(replayUpdates);
 assert(roleMessages.some(m => m.sender === 'user' && m.text === 'prompt 1' && m.topicId === 707));
 assert(roleMessages.some(m => m.sender === 'bot' && m.text === 'response 1' && m.message_thread_id === 707));
@@ -274,7 +351,7 @@ const createState = { topicMode: true, routes: {}, threads: {}, seen: {} };
 const createCalls = [], createMessages = [];
 let creationFails = false, projectAvailable = true;
 let creator;
-creator = new Bridge({ ownerId: owner, botUsername: 'our_bot' }, createState, async (tool, args) => {
+creator = new Bridge({ ownerId: owner, callerThreadId: 'bridge', botUsername: 'our_bot' }, createState, async (tool, args) => {
   createCalls.push({ tool, args });
   if (tool === 'list_projects') return { projects: projectAvailable ? [project] : [] };
   if (tool === 'list_threads') return { pinnedThreads: [], threads: [...recent, { ...t, id: 'other', projectId: 'Q' },
@@ -284,7 +361,7 @@ creator = new Bridge({ ownerId: owner, botUsername: 'our_bot' }, createState, as
     await creator.scan(); // A fast response is discoverable before create_thread returns.
     return { threadId: 'created', hostId: 'local' };
   }
-  if (tool === 'read_thread') return { turns: [{ id: 'fast', status: 'completed', items: [{ type: 'agentMessage', id: 'fast-reply', text: 'FIRST_REPLY_OK' }] }], page: {} };
+  if (tool === 'read_thread') return { turns: [delegatedTurn('fast', createState.telegramPrompts.created?.[0] || 'Create test\nInitial prompt', 'FIRST_REPLY_OK')], page: {} };
   return {};
 }, async (method, args) => {
   createMessages.push({ method, args });

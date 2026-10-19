@@ -13,8 +13,14 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
 - `/projects` → chọn project → **＋ New chat** và 5 chat gần nhất trong project.
 - Bấm New chat rồi gửi prompt đầu tiên để tạo chat trong đúng project.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
-- Topic mới tự lấy tối đa 5 cặp prompt–response đã hoàn tất gần nhất, từ cũ đến mới.
-- Nhắn trong topic để gửi prompt hoặc steer; phản hồi và lỗi về cùng topic.
+- Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; mở topic
+  không tự nhập lịch sử và chat mới trên desktop không tự xuất hiện.
+- Nhắn trong topic để gửi prompt hoặc steer; phản hồi/lỗi từ prompt Telegram tự về.
+- `/update` lấy prompt và phản hồi mới từ desktop về topic hiện tại. Lần đầu lấy
+  tối đa 5 lượt đã xong gần nhất và phần đã có của lượt đang chạy; lần sau lấy
+  phần chưa gửi. Prompt Telegram không cần `/update`.
+- Báo ngay khi chat được chọn chờ cấp quyền hoặc chờ bạn trả lời trong App.
+- `/cancel` dừng đúng lượt đang chạy trong topic hiện tại.
 - Gửi ảnh Photo hoặc file PNG/JPEG/WebP, có thể kèm caption làm yêu cầu.
 - `/quota` xem hạn mức tài khoản và thời điểm reset theo giờ Việt Nam.
 
@@ -106,11 +112,11 @@ không bị lựa chọn chat cũ hoặc Reply sang chat khác ghi đè.
 
 ## Hiển thị lịch sử đúng người gửi
 
-Khi tạo topic, bridge lấy tối đa 5 cặp đã có câu trả lời cuối cùng; chat ít hơn
-5 cặp lấy phần đang có. Lượt đang chạy, reasoning, commentary và log công cụ
-không được nhập làm câu trả lời lịch sử. Topic đã có không nhập lại mỗi lần mở.
+Chọn chat chỉ tạo/mở topic. Dùng `/update` để lấy phần mới từ prompt trên desktop,
+từ cũ đến mới, gồm prompt, lời trả lời/progress đã chốt và lỗi. Phần đang stream,
+reasoning và log công cụ không được chuyển. Tin đã gửi không được nhập lại.
 
-Mặc định Bot API trích dẫn prompt bằng nhãn `Bạn:` và trả lời bằng nhãn `Codex:`.
+Mặc định Bot API trích dẫn prompt bằng nhãn `Bạn:` và gửi lời trả lời từ bot.
 Để **prompt thực sự là tin từ tài khoản của bạn**, còn response là tin từ bot,
 cần đăng nhập thêm Telegram cá nhân bằng MTProto. Chỉ bật nếu bạn đồng ý cho
 ứng dụng gửi các prompt lịch sử vào nhóm riêng đã cấu hình.
@@ -153,7 +159,8 @@ bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượ
 | `/chats` | Chọn chat local có sẵn, tạo/mở topic nếu đang dùng Topics |
 | `/status` | Xem trạng thái chat của topic hoặc chat đang chọn |
 | `/quota` | Xem hạn mức tài khoản, giờ reset và credit khi App cung cấp |
-| `/cancel` | Hủy bước nhập prompt để tạo chat mới |
+| `/update` | Lấy phần chưa gửi từ prompt trên desktop về topic này |
+| `/cancel` | Dừng lượt đang chạy trong topic; nếu đang New chat thì hủy bước tạo |
 | `/help` | Hướng dẫn ngắn |
 
 Trong nhóm dùng được cả `/projects` và `/projects@ten_bot_cua_ban`;
@@ -209,11 +216,17 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
 - Toàn bộ token, ID tài khoản/nhóm/chat, routes, lịch sử mốc đọc, ảnh nhận, PID
   nằm trong `.telegram-codex/`, được gitignore. Folder giới hạn quyền cho tài khoản
   Windows hiện tại và SYSTEM. Bản nguồn không chứa cấu hình cá nhân đã ghép.
-- Bot theo dõi 50 chat Codex local gần nhất, chat ghim và các chat đã chọn/Reply;
-  chỉ ghi mốc lúc gặp chat lần đầu. Riêng khi tạo topic mới, lấy 5 cặp gần nhất.
-- Phản hồi và lỗi được chuyển về Telegram; reasoning và log công cụ không được
-  chuyển. Mỗi item lịch sử được đọc tối đa 20.000 ký tự. Máy phải còn bật/mạng.
-- Bot không tự duyệt yêu cầu cấp quyền của Codex. Khi cần duyệt, xử lý trên App.
+- Menu liệt kê 50 chat local gần nhất và chat ghim. Chỉ chat được chọn hoặc được
+  nhắn trong topic mới được theo dõi. Topic tự tạo từ bản cũ giữ nguyên nhưng
+  không tự theo dõi lại; chat được chọn gần nhất được giữ khi nâng cấp.
+- Nguồn Telegram được nhận diện bằng prompt đã ghi trước khi gửi và item trả về
+  từ App. Khi steer một lượt desktop từ Telegram, phần sau prompt steer tự cập nhật;
+  phần trước đó chờ `/update`. Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
+- Chờ quyền được phát hiện bằng trạng thái `waitingOnApproval`, kiểm tra mỗi 3 giây.
+  Bot báo một lần mỗi đợt chờ. Duyệt và xem chi tiết yêu cầu trong Codex App.
+- `/cancel` dùng pipe phối hợp `codex-ipc` của Desktop với ID lượt cụ thể, không
+  gửi prompt yêu cầu dừng. Giao thức nội bộ có thể đổi khi App cập nhật; lỗi hoặc
+  mất xác nhận được báo rõ và không giả vờ đã dừng. Lệnh không xóa cuộc trò chuyện.
 - Nếu gửi prompt hoặc tạo chat mất kết nối, kiểm tra Codex trước khi gửi lại:
   bot không tự lặp thao tác chưa rõ kết quả. Thông báo Telegram vẫn có thể lặp
   nếu mạng đứt ngay sau khi Telegram nhận tin.
