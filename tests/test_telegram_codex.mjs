@@ -105,9 +105,14 @@ const desktopTurn = (id, text, status = 'completed') => ({ id, status, items: [
   { type: 'userMessage', id: id + '-prompt', content: [{ type: 'text', text: 'desktop ' + id }] },
   { type: 'agentMessage', id: id + '-reply', text },
 ] });
-let turns = [desktopTurn('one', 'desktop response one')], flags = [];
+const telegramAnchor = { id: 'anchor', status: 'completed', items: [
+  { type: 'functionCallOutput', id: 'anchor-prompt', namespace: 'codex_app', name: 'send_message_to_thread',
+    output: { text: '<codex_delegation>\n<source_thread_id>bridge</source_thread_id>\n<input>anchor</input>\n</codex_delegation>' } },
+] };
+let turns = [desktopTurn('one', 'desktop response one'), telegramAnchor], flags = [];
 const scanState = { routes: { old: 'UNSELECTED' }, selected: 'A', topics: { UNSELECTED: 99 },
-  threads: { A: t, UNSELECTED: { title: 'Unselected' }, C: { title: 'C' } }, seen: {} };
+  threads: { A: t, UNSELECTED: { title: 'Unselected' }, C: { title: 'C' } }, seen: {},
+  delivered: { A: ['anchor-prompt'] }, sources: { 'anchor-prompt': 'telegram' } };
 const outgoing = [], scanReads = [], cancelCalls = [];
 const scanner = new Bridge({ ownerId: owner, callerThreadId: 'bridge' }, scanState, async (tool, args) => {
   if (tool === 'send_message_to_thread') return {};
@@ -155,13 +160,21 @@ assert(!outgoing.slice(afterAuto).some(m => m.text.includes('telegram request'))
 await scanner.handle({ message: { ...msg, text: 'steer' } });
 const mixed = desktopTurn('mixed', 'DESKTOP_BEFORE_STEER');
 mixed.items.push(...delegatedTurn('mixed-steer', 'steer', 'TELEGRAM_AFTER_STEER').items);
+mixed.items.push(...desktopTurn('desktop-after', 'DESKTOP_AFTER_STEER').items);
 turns.unshift(mixed);
 await scanner.scan();
 assert(!outgoing.some(m => m.text.includes('DESKTOP_BEFORE_STEER')));
 assert(outgoing.some(m => m.text.includes('TELEGRAM_AFTER_STEER')));
 await scanner.update('A');
-assert(outgoing.some(m => m.text.includes('DESKTOP_BEFORE_STEER')));
+assert(!outgoing.some(m => m.text.includes('DESKTOP_BEFORE_STEER')), 'exclude everything before the latest Telegram prompt, even inside the same turn');
+assert(outgoing.some(m => m.text.includes('DESKTOP_AFTER_STEER')));
 assert.equal(outgoing.filter(m => m.text.includes('TELEGRAM_AFTER_STEER')).length, 1);
+const noAnchorReplies = [];
+const noAnchor = new Bridge({ ownerId: owner }, { selected: 'A', routes: {}, threads: { A: t }, seen: {} },
+  async () => assert.fail('no Telegram prompt means no history import'),
+  async (method, args) => { noAnchorReplies.push(args.text); return { message_id: 1 }; }, () => {});
+await noAnchor.update('A');
+assert(noAnchorReplies[0].includes('Chưa có prompt Telegram làm mốc'));
 // Pending approvals notify without /update, once per waiting episode.
 flags = ['waitingOnApproval'];
 await scanner.scan(); await scanner.scan();
@@ -228,7 +241,7 @@ assert.equal(groupState.routes['-1001234:7'], 'A');
 await groupBridge.handle({ update_id: 104, message: { ...msg, text: '/help' } });
 assert.equal(groupMessages.at(-1).chat_id, owner, 'private help must remain private');
 
-// New topics import five completed pairs, not commentary, tools or unfinished output.
+// Manual import stops at the Telegram boundary; opening a topic imports nothing.
 const historyTurn = n => ({ id: 'history-' + n, status: 'completed', items: [
   { type: 'userMessage', content: [{ type: 'text', text: 'prompt ' + n }] },
   { type: 'agentMessage', id: 'comment-' + n, phase: 'commentary', text: 'working' },
@@ -247,8 +260,9 @@ assert.equal(historyPair({ ...delegated, items: [{ ...delegated.items[0], name: 
 assert.equal(historyPair({ ...delegated, items: [{ ...delegated.items[0], name: 'create_thread' }, delegated.items[1]] }).prompt, 'Telegram prompt');
 
 const historyTurns = [{ ...historyTurn(8), status: 'inProgress' },
-  ...Array.from({ length: 7 }, (_, i) => historyTurn(7 - i))];
+  ...Array.from({ length: 5 }, (_, i) => historyTurn(7 - i)), telegramAnchor, historyTurn(2), historyTurn(1)];
 const historyState = { enabled: { A: true }, topicMode: true, topics: {}, routes: {}, threads: { A: { ...t } },
+  delivered: { A: ['anchor-prompt'] }, sources: { 'anchor-prompt': 'telegram' },
   seen: { A: { keys: [], turnId: 'history-7', updatedAt: 0 } } };
 const historyCalls = [], historyMessages = [];
 const historyBridge = new Bridge({ ownerId: owner }, historyState, async (tool, args) => {
@@ -267,7 +281,7 @@ await Promise.all([historyBridge.send('connected', 'A'), historyBridge.send('con
 assert.equal(historyMessages.filter(m => m.method === 'createForumTopic').length, 1);
 assert.equal(historyCalls.length, 0, 'opening a topic must not import desktop history');
 await historyBridge.update('A');
-assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 6);
+assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 7, 'walk back to the Telegram prompt even past five turns');
 const imported = historyMessages.filter(m => m.method === 'sendMessage').map(m => m.args.text);
 assert.deepEqual(imported.filter(text => /^response/.test(text)), [3,4,5,6,7].map(n => 'response ' + n));
 assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG'));
@@ -277,11 +291,12 @@ assert.equal(historyMessages.length, historyCount, 'desktop responses must not a
 
 // Personal-account history keeps the sender roles and never re-executes old prompts.
 const roleMessages = [], replayUpdates = [], roleCalls = [];
-const roleState = { enabled: { A: true }, topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' } }, seen: {} };
+const roleState = { enabled: { A: true }, topicMode: true, topics: {}, routes: {}, threads: { A: { title: 'A' } }, seen: {},
+  delivered: { A: ['anchor-prompt'] }, sources: { 'anchor-prompt': 'telegram' } };
 let roleBridge, personalId = 9000;
 roleBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, roleState, async (tool, args) => {
   roleCalls.push({ tool, args });
-  if (tool === 'read_thread') return { turns: [historyTurn(1)], page: {} };
+  if (tool === 'read_thread') return { turns: [historyTurn(1), telegramAnchor], page: {} };
   return {};
 }, async (method, args) => {
   roleMessages.push({ sender: 'bot', method, ...args });

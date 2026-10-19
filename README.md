@@ -16,9 +16,8 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
 - Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; mở topic
   không tự nhập lịch sử và chat mới trên desktop không tự xuất hiện.
 - Nhắn trong topic để gửi prompt hoặc steer; phản hồi/lỗi từ prompt Telegram tự về.
-- `/update` lấy prompt và phản hồi mới từ desktop về topic hiện tại. Lần đầu lấy
-  tối đa 5 lượt đã xong gần nhất và phần đã có của lượt đang chạy; lần sau lấy
-  phần chưa gửi. Prompt Telegram không cần `/update`.
+- `/update` lấy phần desktop chưa gửi, chỉ sau prompt Telegram gần nhất của chat.
+  Chưa có prompt Telegram thì chưa nhập lịch sử. Prompt Telegram tự cập nhật.
 - Báo ngay khi chat được chọn chờ cấp quyền hoặc chờ bạn trả lời trong App.
 - `/cancel` dừng đúng lượt đang chạy trong topic hiện tại.
 - Gửi ảnh Photo hoặc file PNG/JPEG/WebP, có thể kèm caption làm yêu cầu.
@@ -113,7 +112,8 @@ không bị lựa chọn chat cũ hoặc Reply sang chat khác ghi đè.
 ## Hiển thị lịch sử đúng người gửi
 
 Chọn chat chỉ tạo/mở topic. Dùng `/update` để lấy phần mới từ prompt trên desktop,
-từ cũ đến mới, gồm prompt, lời trả lời/progress đã chốt và lỗi. Phần đang stream,
+từ sau prompt Telegram gần nhất, theo thứ tự cũ đến mới, gồm prompt, lời trả lời/
+progress đã chốt và lỗi. Phần đang stream,
 reasoning và log công cụ không được chuyển. Tin đã gửi không được nhập lại.
 
 Mặc định Bot API trích dẫn prompt bằng nhãn `Bạn:` và gửi lời trả lời từ bot.
@@ -159,7 +159,7 @@ bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượ
 | `/chats` | Chọn chat local có sẵn, tạo/mở topic nếu đang dùng Topics |
 | `/status` | Xem trạng thái chat của topic hoặc chat đang chọn |
 | `/quota` | Xem hạn mức tài khoản, giờ reset và credit khi App cung cấp |
-| `/update` | Lấy phần chưa gửi từ prompt trên desktop về topic này |
+| `/update` | Lấy phần desktop chưa gửi sau prompt Telegram gần nhất của chat |
 | `/cancel` | Dừng lượt đang chạy trong topic; nếu đang New chat thì hủy bước tạo |
 | `/help` | Hướng dẫn ngắn |
 
@@ -221,7 +221,8 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   không tự theo dõi lại; chat được chọn gần nhất được giữ khi nâng cấp.
 - Nguồn Telegram được nhận diện bằng prompt đã ghi trước khi gửi và item trả về
   từ App. Khi steer một lượt desktop từ Telegram, phần sau prompt steer tự cập nhật;
-  phần trước đó chờ `/update`. Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
+  phần desktop trước prompt đó nằm ngoài phạm vi `/update` và không nhập lại.
+  Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
 - Chờ quyền được phát hiện bằng trạng thái `waitingOnApproval`, kiểm tra mỗi 3 giây.
   Bot báo một lần mỗi đợt chờ. Duyệt và xem chi tiết yêu cầu trong Codex App.
 - `/cancel` dùng pipe phối hợp `codex-ipc` của Desktop với ID lượt cụ thể, không

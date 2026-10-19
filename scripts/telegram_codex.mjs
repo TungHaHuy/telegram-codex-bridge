@@ -299,7 +299,6 @@ export class Bridge {
     // Old auto-created topics are dormant until selected or used again.
     this.state.enabled ||= this.state.selected ? { [this.state.selected]: true } : {};
     this.state.delivered ||= {};
-    this.state.manual ||= {};
     this.state.telegramPrompts ||= {};
     this.state.sources ||= {};
     this.state.attention ||= {};
@@ -370,9 +369,12 @@ export class Bridge {
   }
 
   async pullUpdate(threadId) {
-    const prior = this.state.manual[threadId];
+    const knownTelegram = (this.state.delivered[threadId] || []).some(key => this.state.sources[key] === 'telegram');
+    if (!knownTelegram && !this.state.telegramPrompts[threadId]?.length) {
+      return this.send('Chưa có prompt Telegram làm mốc. Gửi prompt trong topic này trước khi dùng /update.', threadId);
+    }
     const turns = [];
-    let cursor;
+    let cursor, all;
     do {
       const result = await this.call('read_thread', {
         threadId, hostId: 'local', turnLimit: 1, includeOutputs: true,
@@ -380,14 +382,17 @@ export class Bridge {
       });
       turns.push(...(result.turns || []));
       cursor = result.page?.nextCursor;
-    } while (cursor && (prior ? !turns.some(t => t.id === prior.turnId) : turns.filter(t => t.status !== 'inProgress').length < 5));
+      all = this.sourcedEvents(threadId, turns);
+    } while (cursor && !all.some(event => event.role === 'user' && event.origin === 'telegram'));
+    const boundary = all.findLastIndex(event => event.role === 'user' && event.origin === 'telegram');
+    if (boundary < 0) return this.send('Chưa xác định được prompt Telegram làm mốc; chưa nhập tin desktop.', threadId);
+    await this.deliver(threadId, all[boundary]);
     let count = 0;
-    for (const event of this.sourcedEvents(threadId, turns)) {
+    for (const event of all.slice(boundary + 1)) {
       if (event.origin === 'telegram' || this.state.delivered[threadId]?.includes(event.key)) continue;
       await this.deliver(threadId, event);
       count++;
     }
-    this.state.manual[threadId] = { turnId: turns[0]?.id };
     this.persist();
     if (!count) await this.send('Chưa có tin mới từ prompt trên desktop.', threadId);
   }
@@ -564,7 +569,7 @@ export class Bridge {
       return;
     }
     if (command === '/start' || command === '/help') {
-      return controlReply('/projects — chọn project, mở chat gần đây hoặc New chat\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin mới từ prompt trên desktop (lần đầu tối đa 5 lượt gần nhất)\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: bot báo ngay; duyệt trong Codex App.');
+      return controlReply('/projects — chọn project, mở chat gần đây hoặc New chat\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: bot báo ngay; duyệt trong Codex App.');
     }
     if (command === '/chats') {
       const threads = await this.chats();
