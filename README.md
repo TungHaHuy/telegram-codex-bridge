@@ -192,6 +192,20 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
 
 ## Dữ liệu riêng và giới hạn
 
+- Secret được lưu bằng JSON local, không ghi vào mã nguồn và không cần dotenv:
+
+  | File riêng trên máy | Nội dung |
+  | --- | --- |
+  | `.telegram-codex/config.json` | Token BotFather, ID chủ bot/nhóm và chat cầu nối |
+  | `.telegram-codex/user-session.json` | Telegram api_id/api_hash và phiên đăng nhập cá nhân |
+  | `.telegram-codex/state.json` | Tuyến topic, mốc đọc và các prompt lịch sử cần bỏ qua |
+
+  Cả folder `.telegram-codex/` được ignore, bao gồm ảnh, log, QR và thư viện
+  cài riêng. `.env` và `.env.*` cũng bị ignore. Bridge đọc hai file JSON nêu trên,
+  không tự đọc `.env`.
+  Không dùng `git add -f` cho dữ liệu riêng. Khi chuyển máy, cấu hình/đăng nhập
+  lại bằng hướng dẫn setup; Git không mang token hoặc phiên đăng nhập sang máy khác.
+
 - Toàn bộ token, ID tài khoản/nhóm/chat, routes, lịch sử mốc đọc, ảnh nhận, PID
   nằm trong `.telegram-codex/`, được gitignore. Folder giới hạn quyền cho tài khoản
   Windows hiện tại và SYSTEM. Bản nguồn không chứa cấu hình cá nhân đã ghép.
