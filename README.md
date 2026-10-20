@@ -175,6 +175,35 @@ Giới hạn tải là 20 MB/ảnh theo Bot API; chưa gom album thành một pr
 
 ## Dừng, chạy lại và kiểm tra
 
+Để bot tự chạy ẩn khi đăng nhập Windows, sau khi đã ghép tài khoản Telegram:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_telegram_startup.ps1
+```
+
+Script tạo task **Codex Telegram Bridge** cho tài khoản Windows hiện tại và bật
+ngay. Task không lưu mật khẩu, không yêu cầu quyền admin, không bị giới hạn thời
+gian chạy và chỉ chạy một phiên task. Nếu Codex hoặc mạng chưa sẵn sàng lúc bật,
+Task Scheduler thử lại mỗi phút, tối đa 255 lần. Log ở `.telegram-codex/stdout.log`
+và `stderr.log`. Codex App cũng cần tự bật cùng Windows hoặc được bạn mở sau đó.
+
+Kiểm tra cấu hình startup và tiến trình đang chạy:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\test_telegram_startup.ps1
+```
+
+Khi dùng startup, dừng bot bằng `Stop-ScheduledTask` để task không coi việc dừng
+là lỗi cần chạy lại. Tắt tự bật và dừng ngay bằng:
+
+```powershell
+Disable-ScheduledTask -TaskName 'Codex Telegram Bridge'
+Stop-ScheduledTask -TaskName 'Codex Telegram Bridge'
+```
+
+Không chạy bản foreground đồng thời với task startup. Nếu chuyển thư mục repo,
+chạy lại script cài startup tại vị trí mới sau khi xóa task cũ trong Task Scheduler.
+
 Ctrl+C để dừng khi chạy trong terminal. Chạy lại bằng cùng script để tiếp tục
 với tài khoản, topic và mốc phản hồi đã lưu. Nếu chạy ẩn, có thể dừng đúng PID:
 
@@ -232,7 +261,7 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   bot không tự lặp thao tác chưa rõ kết quả. Thông báo Telegram vẫn có thể lặp
   nếu mạng đứt ngay sau khi Telegram nhận tin.
 - Chỉ chat/project Codex local; chưa hỗ trợ chat cloud, video/audio đầu vào,
-  gom album, autorun Windows hoặc tự bật máy. Không có lệnh tắt máy.
+  gom album hoặc tự bật nguồn máy. Không có lệnh tắt máy.
 
 Tài liệu nền: [Telegram Bot API](https://core.telegram.org/bots/api),
 [OpenAI Docs: image inputs](https://learn.chatgpt.com/docs/image-inputs).
