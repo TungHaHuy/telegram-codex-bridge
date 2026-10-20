@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -126,9 +127,29 @@ export async function interruptChat(threadId, turnId) {
   return response.result;
 }
 
-export function localThreads(result) {
+export function readCodexProjectState(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(codexHome, '.codex-global-state.json'), 'utf8').replace(/^\uFEFF/, ''));
+  } catch { return {}; }
+}
+
+export function localThreads(result, projectState = {}) {
+  const assignments = projectState['thread-project-assignments'] || {};
+  const hosts = projectState['thread-project-membership-host-ids'] || {};
+  const projects = projectState['local-projects'] || {};
+  const projectless = new Set(projectState['projectless-thread-ids'] || []);
   return [...new Map([...result.pinnedThreads, ...result.threads]
-    .filter(t => t.kind === 'codex' && t.hostId === 'local').map(t => [t.id, t])).values()];
+    .filter(t => t.kind === 'codex' && t.hostId === 'local').map(t => {
+      // Desktop can omit a new/live chat's project while its saved assignment is valid.
+      // Recover only an explicit local assignment; cwd alone does not establish membership.
+      const assignment = assignments[t.id];
+      if (t.projectId == null && !projectless.has(t.id) &&
+          (hosts[t.id] == null || hosts[t.id] === 'local') &&
+          assignment?.projectKind === 'local' && projects[assignment.projectId]) {
+        t = { ...t, projectId: assignment.projectId };
+      }
+      return [t.id, t];
+    })).values()];
 }
 
 export function localProjects(result) {
@@ -279,7 +300,7 @@ export function conversationEvents(turns) {
 }
 
 export class Bridge {
-  constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal, interrupt = interruptChat) {
+  constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal, interrupt = interruptChat, readProjectState = readCodexProjectState) {
     this.config = config;
     this.state = state;
     this.call = call;
@@ -288,6 +309,7 @@ export class Bridge {
     this.receiveImage = receiveImage;
     this.sendPersonal = sendPersonal;
     this.interrupt = interrupt;
+    this.readProjectState = readProjectState;
     this.readErrors = new Map();
     this.creatingTopics = new Map();
     this.syncing = new Map();
@@ -411,7 +433,7 @@ export class Bridge {
   }
 
   async chats() {
-    const threads = localThreads(await this.call('list_threads', { limit: 50 }));
+    const threads = localThreads(await this.call('list_threads', { limit: 50 }), this.readProjectState());
     for (const thread of threads) this.state.threads[thread.id] = thread;
     this.persist();
     return threads;

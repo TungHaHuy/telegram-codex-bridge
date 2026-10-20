@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, localProjects, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
@@ -397,6 +397,60 @@ await creator.handle(click('project:P'));
 const projectButtons = createMessages.at(-1).args.reply_markup.inline_keyboard;
 assert.equal(projectButtons[0][0].callback_data, 'newchat:P');
 assert.deepEqual(projectButtons.slice(1).map(row => row[0].callback_data), ['r6','r5','r4','r3','r2']);
+
+// New/live chats may have null API project IDs despite explicit saved membership.
+const savedProjects = {
+  'local-projects': { P: { id: 'P' }, Q: { id: 'Q' } },
+  'thread-project-assignments': Object.fromEntries(['new-a', 'new-b', 'projectless', 'different', 'remote-host', 'deleted']
+    .map(id => [id, { projectKind: 'local', projectId: id === 'deleted' ? 'deleted-project' : 'P' }])),
+  'thread-project-membership-host-ids': { 'new-a': 'local', 'remote-host': 'ssh-host' },
+  'projectless-thread-ids': ['projectless'],
+};
+const missingProject = (id, updatedAt = 10) => ({ ...t, id, title: id, projectId: null, cwd: 'same-folder', updatedAt });
+const projectInventory = { pinnedThreads: [], threads: [
+  missingProject('new-a', 12), missingProject('new-b', 11), missingProject('projectless', 99),
+  { ...missingProject('different'), projectId: 'Q' }, missingProject('remote-host'), missingProject('deleted'),
+  missingProject('no-assignment'), { ...missingProject('cloud'), hostId: 'remote' },
+  ...recent,
+] };
+const resolved = localThreads(projectInventory, savedProjects);
+assert.equal(resolved.find(t => t.id === 'new-a').projectId, 'P');
+assert.equal(resolved.find(t => t.id === 'new-b').projectId, 'P');
+assert.equal(resolved.find(t => t.id === 'different').projectId, 'Q', 'retain a known API project');
+for (const id of ['projectless', 'remote-host', 'deleted', 'no-assignment']) {
+  assert.equal(resolved.find(t => t.id === id).projectId, null, 'do not infer membership: ' + id);
+}
+assert(!resolved.some(t => t.id === 'cloud'));
+assert.equal(projectInventory.threads[0].projectId, null, 'do not mutate API results');
+const fixedMenuMessages = [], fixedMenuState = { routes: {}, threads: {}, seen: {} };
+const fixedMenu = new Bridge({ ownerId: owner }, fixedMenuState, async tool => {
+  if (tool === 'list_projects') return { projects: [project] };
+  assert.equal(tool, 'list_threads'); return projectInventory;
+}, async (method, args) => { fixedMenuMessages.push(args); return { message_id: fixedMenuMessages.length }; },
+() => {}, undefined, undefined, undefined, () => savedProjects);
+await fixedMenu.handle(click('project:P'));
+assert.deepEqual(fixedMenuMessages.at(-1).reply_markup.inline_keyboard.slice(1).map(row => row[0].callback_data),
+  ['new-a', 'new-b', 'r6', 'r5', 'r4']);
+assert.equal(fixedMenuState.threads['new-a'].projectId, 'P');
+assert.deepEqual(fixedMenuState.enabled, {}, 'listing chats must not opt them into forwarding');
+savedProjects['thread-project-assignments']['new-a'].projectId = 'Q';
+await fixedMenu.handle(click('project:P'));
+assert(!fixedMenuMessages.at(-1).reply_markup.inline_keyboard.flat().some(button => button.callback_data === 'new-a'),
+  'refresh saved membership on each menu request');
+
+const projectStateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telegram-codex-project-state-'));
+const projectStateFile = path.join(projectStateDir, '.codex-global-state.json');
+try {
+  assert.deepEqual(readCodexProjectState(projectStateDir), {}, 'missing state preserves API-only behavior');
+  fs.writeFileSync(projectStateFile, '\uFEFF' + JSON.stringify(savedProjects));
+  assert.deepEqual(readCodexProjectState(projectStateDir), savedProjects);
+  fs.writeFileSync(projectStateFile, '{incomplete');
+  assert.deepEqual(readCodexProjectState(projectStateDir), {}, 'an unreadable snapshot must not break chat listing');
+} finally {
+  if (fs.existsSync(projectStateFile)) fs.unlinkSync(projectStateFile);
+  fs.rmdirSync(projectStateDir);
+}
+
 await creator.handle(click('newchat:P'));
 assert(!createCalls.some(c => c.tool === 'create_thread'), 'selecting a project must not start a chat');
 await creator.handle(input('another topic', { message_thread_id: 999 }));

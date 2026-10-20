@@ -274,3 +274,10 @@ kích thước. Khi tạo chat, đăng ký mốc rỗng trước lượt scan ti
 phản hồi đầu quá nhanh. Các tình huống này có kiểm tra hồi quy trong test hiện có.
 Tin gửi bằng phiên cá nhân sẽ quay về Bot API như tin của chủ bot: phải ghi nhận
 ID và chờ thao tác nhập lịch sử đang chạy trước khi xử lý update, tránh lặp prompt.
+
+Khi `list_threads` trả `projectId: null` cho chat mới/đang mở, bridge đối chiếu
+liên kết project đã lưu trong `<CODEX_HOME>/.codex-global-state.json` (mặc định
+`~/.codex`). Chỉ dùng liên kết local rõ ràng tới project còn tồn tại, không suy
+đoán theo thư mục làm việc. Chat được đánh dấu không thuộc project, liên kết host
+khác và `projectId` đã có từ App được giữ nguyên. File thiếu hoặc chưa đọc được
+thì dùng danh sách App như trước; bridge không sửa dữ liệu project của Codex.
