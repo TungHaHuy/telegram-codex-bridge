@@ -27,4 +27,59 @@ $testPid = [int](Get-Content -LiteralPath (Join-Path $testRoot '.telegram-codex\
 if ($testPid -ne $testProcesses[0].ProcessId) { throw 'PID lock does not match the running bot.' }
 $testLog = Get-Content -LiteralPath (Join-Path $testRoot '.telegram-codex\stdout.log') -Raw -Encoding UTF8
 if ($testLog -notmatch 'Ctrl\+C') { throw 'Bot has not confirmed readiness.' }
-Write-Output 'telegram_startup: logon, hidden launch, retry, single process and readiness checks passed.'
+
+# Reproduce Codex being unavailable initially without closing the user's Codex App.
+$testRetryRoot = Join-Path ([IO.Path]::GetTempPath()) ('telegram startup retry-' + [Guid]::NewGuid().ToString('N'))
+$testRetryScript = Join-Path $testRetryRoot 'scripts'
+$testRetryLocal = Join-Path $testRetryRoot '.telegram-codex'
+$testRetryProcess = $null
+try {
+    New-Item -ItemType Directory -Path $testRetryScript,$testRetryLocal -Force | Out-Null
+    Copy-Item -LiteralPath $testLauncher -Destination (Join-Path $testRetryScript 'start_telegram_codex.ps1')
+    Set-Content -LiteralPath (Join-Path $testRetryLocal 'config.json') -Value '{}' -Encoding ASCII
+    @'
+import fs from 'node:fs';
+const local = new URL('../.telegram-codex/', import.meta.url);
+const file = new URL('attempts.txt', local);
+const attempt = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;
+fs.writeFileSync(new URL('test.pid', local), String(process.pid));
+fs.writeFileSync(file, String(attempt));
+if (attempt === 1) { console.error('Codex unavailable (test)'); process.exit(1); }
+console.log('READY_AFTER_RETRY');
+setInterval(() => {}, 1000);
+'@ | Set-Content -LiteralPath (Join-Path $testRetryScript 'telegram_codex.mjs') -Encoding ASCII
+    $testRetryLauncher = Join-Path $testRetryScript 'start_telegram_codex.ps1'
+    $testRetryProcess = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $testRetryLauncher + '" -Background') `
+        -WindowStyle Hidden -PassThru
+    $testRetryReady = $false
+    for ($attempt = 0; $attempt -lt 160; $attempt++) {
+        $testRetryLog = Join-Path $testRetryLocal 'stdout.log'
+        if ((Test-Path -LiteralPath $testRetryLog) -and
+            (Get-Content -LiteralPath $testRetryLog -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -match 'READY_AFTER_RETRY') {
+            $testRetryReady = $true; break
+        }
+        if ($testRetryProcess.HasExited) { throw 'Launcher exited instead of waiting for Codex.' }
+        Start-Sleep -Milliseconds 250
+    }
+    if (!$testRetryReady -or [int](Get-Content -LiteralPath (Join-Path $testRetryLocal 'attempts.txt')) -ne 2) {
+        throw 'Bot did not recover after the initial startup failure.'
+    }
+} finally {
+    if ($testRetryProcess -and !$testRetryProcess.HasExited) { Stop-Process -Id $testRetryProcess.Id -Force; $testRetryProcess.WaitForExit() }
+    $testRetryPidFile = Join-Path $testRetryLocal 'test.pid'
+    if (Test-Path -LiteralPath $testRetryPidFile) {
+        $testRetryPid = [int](Get-Content -LiteralPath $testRetryPidFile)
+        $testRetryChild = Get-CimInstance Win32_Process -Filter "ProcessId=$testRetryPid"
+        if ($testRetryChild -and $testRetryChild.Name -eq 'node.exe' -and
+            $testRetryChild.CommandLine -like ('*' + (Join-Path $testRetryScript 'telegram_codex.mjs') + '*')) {
+            Stop-Process -Id $testRetryPid -Force
+            Wait-Process -Id $testRetryPid -Timeout 10 -ErrorAction SilentlyContinue
+        }
+    }
+    $testRetryPath = [IO.Path]::GetFullPath($testRetryRoot)
+    $testTempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\telegram startup retry-'
+    if (!$testRetryPath.StartsWith($testTempPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path.' }
+    Remove-Item -LiteralPath $testRetryPath -Recurse -Force
+}
+Write-Output 'telegram_startup: logon, hidden launch, single process, readiness and recovery after startup failure passed.'

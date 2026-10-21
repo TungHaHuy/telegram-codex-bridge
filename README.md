@@ -183,8 +183,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_telegram_s
 
 Script tạo task **Codex Telegram Bridge** cho tài khoản Windows hiện tại và bật
 ngay. Task không lưu mật khẩu, không yêu cầu quyền admin, không bị giới hạn thời
-gian chạy và chỉ chạy một phiên task. Nếu Codex hoặc mạng chưa sẵn sàng lúc bật,
-Task Scheduler thử lại mỗi phút, tối đa 255 lần. Log ở `.telegram-codex/stdout.log`
+gian chạy và chỉ chạy một phiên task. Nếu Codex hoặc mạng chưa sẵn sàng khiến
+bot thoát lỗi, launcher chờ 15 giây rồi thử lại, không giới hạn số lần.
+Task Scheduler vẫn thử lại mỗi phút, tối đa 255 lần nếu chính launcher gặp lỗi.
+Log ở `.telegram-codex/stdout.log`
 và `stderr.log`. Codex App cũng cần tự bật cùng Windows hoặc được bạn mở sau đó.
 
 Kiểm tra cấu hình startup và tiến trình đang chạy:

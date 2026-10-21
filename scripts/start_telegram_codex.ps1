@@ -24,10 +24,13 @@ if (!(Test-Path -LiteralPath $taskConfig)) {
 if ($Background) {
     $taskNode = (Get-Command node.exe -ErrorAction Stop).Source
     $taskBridge = Join-Path $PSScriptRoot 'telegram_codex.mjs'
-    $taskProcess = Start-Process -FilePath $taskNode -ArgumentList ('"' + $taskBridge + '"') `
-        -WorkingDirectory $taskRoot -WindowStyle Hidden -Wait -PassThru `
-        -RedirectStandardOutput (Join-Path $taskLocal 'stdout.log') `
-        -RedirectStandardError (Join-Path $taskLocal 'stderr.log')
-    exit $taskProcess.ExitCode
+    while ($true) {
+        $taskProcess = Start-Process -FilePath $taskNode -ArgumentList ('"' + $taskBridge + '"') `
+            -WorkingDirectory $taskRoot -WindowStyle Hidden -Wait -PassThru `
+            -RedirectStandardOutput (Join-Path $taskLocal 'stdout.log') `
+            -RedirectStandardError (Join-Path $taskLocal 'stderr.log')
+        if ($taskProcess.ExitCode -eq 0) { exit 0 }
+        Start-Sleep -Seconds 15
+    }
 }
 & node (Join-Path $PSScriptRoot 'telegram_codex.mjs')
