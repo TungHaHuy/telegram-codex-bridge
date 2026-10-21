@@ -19,6 +19,9 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
 - `/update` lấy phần desktop chưa gửi, chỉ sau prompt Telegram gần nhất của chat.
   Chưa có prompt Telegram thì chưa nhập lịch sử. Prompt Telegram tự cập nhật.
 - Báo ngay khi chat được chọn chờ cấp quyền hoặc chờ bạn trả lời trong App.
+- Câu hỏi lựa chọn của Codex được chuyển ngay với đầy đủ nội dung/lựa chọn,
+  kể cả prompt đến từ desktop và lượt chat vẫn đang chạy; không cần `/update`.
+  Phản hồi desktop thông thường vẫn chờ `/update` như trước.
 - `/cancel` dừng đúng lượt đang chạy trong topic hiện tại.
 - Gửi ảnh Photo hoặc file PNG/JPEG/WebP, có thể kèm caption làm yêu cầu.
 - `/quota` xem hạn mức tài khoản và thời điểm reset theo giờ Việt Nam.
@@ -256,6 +259,10 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
 - Chờ quyền được phát hiện bằng trạng thái `waitingOnApproval`, kiểm tra mỗi 3 giây.
   Bot báo một lần mỗi đợt chờ. Duyệt và xem chi tiết yêu cầu trong Codex App.
+- Câu hỏi `request_user_input_async` được App Tools trả như agent message đã chốt
+  với call ID; không áp dụng bộ lọc streaming/desktop cho câu hỏi mới hoặc đang
+  diễn ra. Mốc đã gửi chống lặp; không nhập lại câu hỏi lịch sử đã hoàn tất khi
+  vừa chọn chat. Bot không tự chọn câu trả lời hoặc tự duyệt quyền.
 - `/cancel` dùng pipe phối hợp `codex-ipc` của Desktop với ID lượt cụ thể, không
   gửi prompt yêu cầu dừng. Giao thức nội bộ có thể đổi khi App cập nhật; lỗi hoặc
   mất xác nhận được báo rõ và không giả vờ đã dừng. Lệnh không xóa cuộc trò chuyện.

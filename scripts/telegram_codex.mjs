@@ -289,9 +289,12 @@ export function conversationEvents(turns) {
           ['create_thread', 'send_message_to_thread'].includes(item.name)) {
         const match = item.output?.text?.match(/^<codex_delegation>\s*<source_thread_id>([^<]+)<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/);
         if (match) result.push({ key, text: match[2], role: 'user', caller: match[1], turnId: turn.id });
-      } else if (item.type === 'agentMessage' && item.text &&
-          !(turn.status === 'inProgress' && index === items.length - 1)) {
-        result.push({ key, text: item.text, role: 'assistant', turnId: turn.id });
+      } else if (item.type === 'agentMessage' && item.text) {
+        // App Tools projects request_user_input_async as a final agent message with its call ID.
+        const question = item.phase === 'final_answer' && item.id?.startsWith('call_');
+        if (!question && turn.status === 'inProgress' && index === items.length - 1) continue;
+        result.push({ key, text: item.text, role: 'assistant', turnId: turn.id,
+          ...(question ? { question: true, activeQuestion: turn.status === 'inProgress' } : {}) });
       }
     }
     if (turn.error) result.push({ key: turn.id + ':error', text: 'Lỗi Codex: ' + JSON.stringify(turn.error), role: 'assistant', turnId: turn.id });
@@ -680,7 +683,9 @@ export class Bridge {
         this.state.attention[id] = attention;
         const all = this.sourcedEvents(id, turns);
         for (const event of all) {
-          if (event.origin === 'telegram') await this.deliver(id, event);
+          // Questions need attention even for desktop prompts; do not backfill old completed questions.
+          const newQuestion = event.question && (event.activeQuestion || (prior && !prior.keys.includes(event.key)));
+          if (event.origin === 'telegram' || newQuestion) await this.deliver(id, event);
         }
         this.state.seen[id] = {
           turnId: turns[0]?.id,

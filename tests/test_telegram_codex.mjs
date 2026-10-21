@@ -200,6 +200,32 @@ await scanner.scan(); assert(scanner.state.seen.C, 'a broken chat must not block
 await scanner.handle({ message: { ...msg, text: '/update' } });
 assert(outgoing.at(-1).text.includes('Chưa cập nhật đủ tin từ desktop: history limit'));
 
+// App question cards are final call-ID messages, even when the active turn has no waiting flag.
+let questionTurn = { id: 'question-turn', status: 'inProgress', items: [
+  { type: 'userMessage', id: 'desktop-question-prompt', content: [{ type: 'text', text: 'desktop task' }] },
+  { type: 'agentMessage', id: 'call_question_1', phase: 'final_answer', text: 'Chọn màu?\n- Xanh\n- Đỏ' },
+] };
+const questionReplies = [];
+const questionState = { selected: 'A', threads: { A: t }, routes: {}, seen: {} };
+const questionCall = async () => ({ thread: { status: { type: 'active', activeFlags: [] } }, turns: [questionTurn], page: {} });
+const questionTelegram = async (method, args) => { questionReplies.push(args.text); return { message_id: questionReplies.length }; };
+const questionBridge = new Bridge({ ownerId: owner }, questionState, questionCall, questionTelegram, () => {});
+await questionBridge.scan(); await questionBridge.scan();
+assert.deepEqual(questionReplies, ['[Chat A]\nChọn màu?\n- Xanh\n- Đỏ'], 'forward the complete last question without /update');
+questionTurn.items.push({ type: 'agentMessage', id: 'ordinary-final', phase: 'final_answer', text: 'DESKTOP_STILL_MANUAL' });
+questionTurn.status = 'completed'; await questionBridge.scan();
+assert.equal(questionReplies.length, 1, 'ordinary desktop answers must stay manual');
+const questionRestart = new Bridge({ ownerId: owner }, JSON.parse(JSON.stringify(questionState)), questionCall, questionTelegram, () => {});
+await questionRestart.scan(); assert.equal(questionReplies.length, 1, 'a restart must not duplicate a question');
+questionTurn = { ...questionTurn, id: 'fast-question', items: [
+  { type: 'agentMessage', id: 'call_question_2', phase: 'final_answer', text: 'Fast question?' },
+] };
+await questionBridge.scan(); assert(questionReplies.at(-1).includes('Fast question?'), 'a question that finishes before polling must still arrive');
+const historicalReplies = [];
+const historicalQuestions = new Bridge({ ownerId: owner }, { selected: 'A', threads: { A: t }, routes: {}, seen: {} },
+  questionCall, async (method, args) => { historicalReplies.push(args); return { message_id: 1 }; }, () => {});
+await historicalQuestions.scan(); assert.equal(historicalReplies.length, 0, 'selecting a chat must not replay completed historical questions');
+
 // Topics are the routing authority, including when a reply or selection disagrees.
 const topicState = {
   enabled: { A: true, B: true }, topicMode: true, topics: { A: 101, B: 202 }, routes: { 7: 'B' }, selected: 'B',
