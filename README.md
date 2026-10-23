@@ -263,6 +263,14 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   với call ID; không áp dụng bộ lọc streaming/desktop cho câu hỏi mới hoặc đang
   diễn ra. Mốc đã gửi chống lặp; không nhập lại câu hỏi lịch sử đã hoàn tất khi
   vừa chọn chat. Bot không tự chọn câu trả lời hoặc tự duyệt quyền.
+- Sau khi bot gửi câu hỏi mới, tin nhắn tiếp theo trong topic được dùng làm câu
+  trả lời và đóng đúng thẻ một lần. `/quota`, `/update` và các lệnh điều khiển
+  không tính là câu trả lời; `/cancel` hủy trạng thái chờ. Tin tiếp sau câu trả
+  lời trở lại đường gửi prompt thường. Câu hỏi lịch sử không chặn prompt mới.
+  Bot đọc metadata đúng call ID trong `<CODEX_HOME>/sessions` để xác định thẻ.
+  Nếu Codex đã ngắt theo dõi chat khi để lâu, bridge mở lại chat trước khi gửi
+  câu trả lời. Nếu chưa chuẩn bị được thao tác đóng thẻ, bot báo và gửi nguyên
+  tin nhắn theo đường thường; sau khi đã gửi mà mất xác nhận thì không gửi lại.
 - `/cancel` dùng pipe phối hợp `codex-ipc` của Desktop với ID lượt cụ thể, không
   gửi prompt yêu cầu dừng. Giao thức nội bộ có thể đổi khi App cập nhật; lỗi hoặc
   mất xác nhận được báo rõ và không giả vờ đã dừng. Lệnh không xóa cuộc trò chuyện.
@@ -283,6 +291,8 @@ kích thước. Khi tạo chat, đăng ký mốc rỗng trước lượt scan ti
 phản hồi đầu quá nhanh. Các tình huống này có kiểm tra hồi quy trong test hiện có.
 Tin gửi bằng phiên cá nhân sẽ quay về Bot API như tin của chủ bot: phải ghi nhận
 ID và chờ thao tác nhập lịch sử đang chạy trước khi xử lý update, tránh lặp prompt.
+Input trong `codex_delegation` được giải mã đúng một lớp XML trước khi đối chiếu
+nguồn, để prompt chứa mã HTML/XML vẫn nhận phản hồi tự động từ Telegram.
 
 Khi `list_threads` trả `projectId: null` cho chat mới/đang mở, bridge đối chiếu
 liên kết project đã lưu trong `<CODEX_HOME>/.codex-global-state.json` (mặc định

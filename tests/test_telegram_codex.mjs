@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
@@ -45,6 +45,20 @@ await bridge.handle({ update_id: 4, message: msg });
 assert.equal(calls.length, 2, 'uncertain dispatch must not retry');
 assert(sent.at(-1).text.includes('không tự gửi lại'));
 assert.equal(state.pending, undefined);
+
+// A displayed question must never divert a new prompt to a window-owner-only route.
+const ownerlessCalls = [];
+const ownerless = new Bridge({ ownerId: owner }, {
+  selected: 'A', threads: { A: { title: 'Idle chat' } }, delivered: { A: ['call_question'] }, routes: {}, seen: {},
+}, async (tool, args) => {
+  ownerlessCalls.push({ tool, args });
+  if (tool !== 'send_message_to_thread') throw new Error('no-client-found');
+  return { message: 'accepted' };
+}, async () => ({ message_id: 1 }), () => {});
+await ownerless.handle({ message: { ...msg, text: 'sao rồi bro' } });
+assert.deepEqual(ownerlessCalls, [{ tool: 'send_message_to_thread', args: {
+  threadId: 'A', hostId: 'local', prompt: 'sao rồi bro',
+} }], 'question history must not rewrite or intercept a prompt to an idle chat');
 
 // Real framed transport with fragmented bytes, including a multibyte response.
 const endpoint = process.platform === 'win32' ? '\\\\.\\pipe\\telegram-codex-test-' + process.pid : '/tmp/telegram-codex-test-' + process.pid;
@@ -136,6 +150,21 @@ const delegatedTurn = (id, prompt, reply, caller = 'bridge') => ({ id, status: '
     output: { text: '<codex_delegation>\n<source_thread_id>' + caller + '</source_thread_id>\n<input>' + prompt + '</input>\n</codex_delegation>' } },
   { type: 'agentMessage', id: id + '-reply', text: reply },
 ] });
+// XML/code is escaped by Codex before read_thread returns the delegated prompt.
+const xmlPrompt = '<entry title="test">Tom & Jerry &lt;literal&gt;</entry>';
+const escapedXml = '&lt;entry title=&quot;test&quot;&gt;Tom &amp; Jerry &amp;lt;literal&amp;gt;&lt;/entry&gt;';
+const xmlTurn = delegatedTurn('xml-source', escapedXml, 'XML_REPLY_OK');
+assert.equal(historyPair(xmlTurn).prompt, xmlPrompt, 'decode only the XML envelope layer');
+const xmlMessages = [];
+const xmlBridge = new Bridge({ ownerId: owner, callerThreadId: 'bridge' }, {
+  selected: 'A', threads: { A: t }, routes: {}, seen: {}, telegramPrompts: { A: [xmlPrompt] },
+}, async () => ({ turns: [xmlTurn], page: {}, thread: {} }), async (method, args) => {
+  xmlMessages.push(args.text); return { message_id: xmlMessages.length };
+}, () => {});
+await xmlBridge.scan(); await xmlBridge.scan();
+assert.equal(xmlBridge.state.sources['xml-source-prompt'], 'telegram');
+assert.equal(xmlBridge.state.telegramPrompts.A.length, 0);
+assert.deepEqual(xmlMessages, ['[Chat A]\nXML_REPLY_OK'], 'escaped Telegram prompts must produce one automatic reply');
 await scanner.handle({ message: { ...msg, text: 'telegram request' } });
 turns.unshift(delegatedTurn('tele', 'telegram request', 'TELEGRAM_AUTO_OK'));
 await scanner.scan(); await scanner.scan();
@@ -212,6 +241,7 @@ const questionTelegram = async (method, args) => { questionReplies.push(args.tex
 const questionBridge = new Bridge({ ownerId: owner }, questionState, questionCall, questionTelegram, () => {});
 await questionBridge.scan(); await questionBridge.scan();
 assert.deepEqual(questionReplies, ['[Chat A]\nChọn màu?\n- Xanh\n- Đỏ'], 'forward the complete last question without /update');
+assert.equal(questionState.awaitingQuestions.A, 'call_question_1');
 questionTurn.items.push({ type: 'agentMessage', id: 'ordinary-final', phase: 'final_answer', text: 'DESKTOP_STILL_MANUAL' });
 questionTurn.status = 'completed'; await questionBridge.scan();
 assert.equal(questionReplies.length, 1, 'ordinary desktop answers must stay manual');
@@ -225,6 +255,86 @@ const historicalReplies = [];
 const historicalQuestions = new Bridge({ ownerId: owner }, { selected: 'A', threads: { A: t }, routes: {}, seen: {} },
   questionCall, async (method, args) => { historicalReplies.push(args); return { message_id: 1 }; }, () => {});
 await historicalQuestions.scan(); assert.equal(historicalReplies.length, 0, 'selecting a chat must not replay completed historical questions');
+assert.deepEqual(historicalQuestions.state.awaitingQuestions, {}, 'historical cards must not arm a reply');
+
+// One newly forwarded question consumes one text reply, including across a restart.
+const replyCalls = [], replyNotices = [];
+const replyState = JSON.parse(JSON.stringify(questionState));
+const replyBridge = new Bridge({ ownerId: owner }, replyState, async (tool, args) => {
+  replyCalls.push({ tool, args }); return {};
+}, async (method, args) => { replyNotices.push(args.text); return { message_id: 1 }; }, () => {});
+let nativeAnswers = 0;
+replyBridge.readQuestion = (id, callId) => {
+  assert.equal(id, 'A'); assert.equal(callId, 'call_question_2');
+  return [{ questionItemId: '["request_user_input_async","call_question_2",0]', question: 'Fast question?' }];
+};
+replyBridge.prepareQuestion = async (id, questions, answer) => ({ prompt: '<send_user_message_question_reply>test receipt', send: async () => {
+  nativeAnswers++; assert.equal(answer, 'A');
+  assert.equal(replyState.awaitingQuestions.A, undefined, 'consume before dispatch');
+  assert(replyState.telegramPrompts.A.includes('<send_user_message_question_reply>test receipt'));
+  return { message: 'answered' };
+} });
+await replyBridge.handle({ message: { ...msg, text: '/quota' } });
+assert.equal(replyState.awaitingQuestions.A, 'call_question_2', 'commands do not consume an answer');
+await replyBridge.handle({ message: { ...msg, text: 'A' } });
+assert.equal(nativeAnswers, 1);
+await replyBridge.handle({ message: { ...msg, text: 'New prompt' } });
+assert.equal(nativeAnswers, 1, 'the next prompt must not answer the same card again');
+assert.deepEqual(replyCalls.filter(c => c.tool === 'send_message_to_thread').map(c => c.args.prompt), ['New prompt']);
+const nativeEvents = replyBridge.sourcedEvents('A', [{ id: 'receipt-turn', items: [
+  { id: 'receipt-input', type: 'userMessage', content: [{ type: 'text', text: '<send_user_message_question_reply>test receipt' }] },
+  { id: 'receipt-output', type: 'agentMessage', text: 'OK' },
+] }]);
+assert(nativeEvents.every(e => e.origin === 'telegram'));
+replyState.awaitingQuestions.A = 'call_question_2';
+replyBridge.prepareQuestion = async () => { throw new Error('owner unavailable'); };
+await replyBridge.handle({ message: { ...msg, text: 'Original answer' } });
+assert.equal(replyCalls.at(-1).args.prompt, 'Original answer', 'preparation failure sends the untouched text normally');
+replyState.awaitingQuestions.A = 'call_question_2';
+replyBridge.prepareQuestion = async () => ({ prompt: 'uncertain receipt', send: async () => { throw new Error('timeout'); } });
+const sendsBeforeTimeout = replyCalls.length;
+await replyBridge.handle({ message: { ...msg, text: 'A' } });
+assert.equal(replyCalls.length, sendsBeforeTimeout, 'uncertain native submission must never send a second prompt');
+assert(replyNotices.at(-1).includes('không tự gửi lại'));
+replyBridge.call = questionCall;
+await replyBridge.scan();
+assert.equal(replyState.awaitingQuestions.A, undefined, 'already delivered cards must not rearm');
+
+// Missing owners are restored before submission; no extra model prompt is sent.
+const prepareCalls = [], requests = [];
+let discovery = 0;
+const cardFields = [{ questionItemId: '["request_user_input_async","call_card",0]', question: 'A or B?' }];
+const prepared = await prepareQuestionReply('A', cardFields, 'A', async (tool, args) => {
+  prepareCalls.push({ tool, args }); return { thread: { cwd: '/work' }, turns: [] };
+}, async (method, params) => {
+  requests.push({ method, params });
+  if (method === 'thread-owner-discovery') {
+    if (discovery++ === 0) throw new Error('no-client-found');
+    return { handledByClientId: 'restored-owner' };
+  }
+  return { result: { result: {} } };
+});
+assert.deepEqual(prepareCalls.map(c => c.tool), ['navigate_to_codex_page', 'read_thread']);
+assert(requests.every(r => r.method === 'thread-owner-discovery'), 'preparation cannot submit a prompt');
+assert(prepared.prompt.includes('Trả lời từ Telegram: A'));
+await prepared.send();
+assert.equal(requests.at(-1).method, 'thread-follower-start-turn');
+assert.equal(requests.filter(r => r.method !== 'thread-owner-discovery').length, 1);
+
+const cardDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-card-'));
+try {
+  fs.mkdirSync(path.join(cardDir, 'sessions'));
+  const cardFile = path.join(cardDir, 'sessions', 'rollout-A.jsonl');
+  fs.writeFileSync(cardFile, JSON.stringify({ type: 'event_msg', payload: { item: {
+    type: 'AgentMessage', id: 'call_card', delivery: 'async', questions: [{ title: 'A or B?' }],
+  } } }) + '\n');
+  assert.deepEqual(pendingQuestion('A', 'call_card', cardDir), cardFields);
+  fs.appendFileSync(cardFile, JSON.stringify({ type: 'response_item', payload: { role: 'user', content: [{ text: prepared.prompt }] } }) + '\n');
+  assert.equal(pendingQuestion('A', 'call_card', cardDir), null, 'desktop/native answers must not be submitted twice');
+} finally {
+  assert(path.resolve(cardDir).startsWith(path.resolve(os.tmpdir()) + path.sep));
+  fs.rmSync(cardDir, { recursive: true });
+}
 
 // Topics are the routing authority, including when a reply or selection disagrees.
 const topicState = {

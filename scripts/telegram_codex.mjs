@@ -127,6 +127,68 @@ export async function interruptChat(threadId, turnId) {
   return response.result;
 }
 
+export function pendingQuestion(threadId, callId, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')) {
+  const root = path.join(codexHome, 'sessions');
+  const file = fs.readdirSync(root, { recursive: true }).find(name => name.endsWith('-' + threadId + '.jsonl'));
+  if (!file) throw new Error('Không tìm thấy dữ liệu câu hỏi.');
+  let questions;
+  const answered = new Set();
+  for (const line of fs.readFileSync(path.join(root, file), 'utf8').split('\n')) {
+    if (!line.includes(callId)) continue;
+    let row;
+    try { row = JSON.parse(line); } catch { continue; }
+    const item = row.payload?.item;
+    if (item?.id === callId && item.type === 'AgentMessage' && item.delivery === 'async') questions = item.questions;
+    if (row.type !== 'response_item' || row.payload?.role !== 'user') continue;
+    const match = row.payload.content?.map(p => p.text || '').join('\n').trim()
+      .match(/^<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>$/);
+    if (!match) continue;
+    try {
+      for (const reply of [JSON.parse(match[1])].flat()) {
+        const [tool, id, index] = JSON.parse(reply.questionItemId);
+        if (tool === 'request_user_input_async' && id === callId) answered.add(index);
+      }
+    } catch { /* Ignore unrelated input. */ }
+  }
+  const remaining = (questions || []).flatMap((q, index) => typeof q.title === 'string' && !answered.has(index) ?
+    [{ questionItemId: JSON.stringify(['request_user_input_async', callId, index]), question: q.title }] : []);
+  return remaining.length ? remaining : null;
+}
+
+export async function prepareQuestionReply(threadId, questions, answer, call, request = desktopRequest) {
+  let owner;
+  try { owner = await request('thread-owner-discovery', { hostId: 'local', conversationId: threadId }, 1); }
+  catch (error) {
+    if (error.message !== 'no-client-found') throw error;
+    // Loading the selected chat restores its owner after Codex's idle unsubscribe.
+    await call('navigate_to_codex_page', { threadId });
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await sleep(250);
+      try { owner = await request('thread-owner-discovery', { hostId: 'local', conversationId: threadId }, 1); break; }
+      catch (retry) { if (retry.message !== 'no-client-found') throw retry; }
+    }
+    if (!owner) throw new Error('Chưa nạp được chat để đóng thẻ.');
+  }
+  const current = await call('read_thread', { threadId, hostId: 'local', turnLimit: 1 });
+  const prompt = '<send_user_message_question_reply>\n' + JSON.stringify(questions.map(q => ({
+    ...q, answer: 'Trả lời từ Telegram: ' + answer,
+  }))) + '\n</send_user_message_question_reply>';
+  const input = [{ type: 'text', text: prompt, text_elements: [] }];
+  const restoreMessage = { cwd: current.thread.cwd,
+    context: { prompt, addedFiles: [], fileAttachments: [], imageAttachments: [], ideContext: null } };
+  const active = current.turns?.[0]?.status === 'inProgress';
+  return { prompt, send: async () => {
+    const response = await request(active ? 'thread-follower-steer-turn' : 'thread-follower-start-turn', active ? {
+      conversationId: threadId, input, restoreMessage, attachments: [], clientUserMessageId: crypto.randomUUID(),
+    } : { conversationId: threadId, turnStart: {
+      request: { threadId, input, turnTrigger: 'send_user_message_async_question', responsesapiClientMetadata: { source: 'telegram_bridge' } },
+      context: { inheritThreadSettings: true, attachments: [], restoreMessage },
+    } }, active ? 1 : 2, owner.handledByClientId);
+    if (!response.result?.result) throw new Error('Codex chưa xác nhận câu trả lời.');
+    return { message: 'Đã gửi câu trả lời và đóng thẻ câu hỏi.' };
+  } };
+}
+
 export function readCodexProjectState(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')) {
   try {
     return JSON.parse(fs.readFileSync(path.join(codexHome, '.codex-global-state.json'), 'utf8').replace(/^\uFEFF/, ''));
@@ -256,6 +318,12 @@ export function events(turns) {
   return result;
 }
 
+function delegationText(text) {
+  // Codex serializes delegation input as XML text; decode exactly one layer.
+  const entities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+  return text.replace(/&(amp|lt|gt|quot|apos);/g, (_, name) => entities[name]);
+}
+
 export function historyPair(turn) {
   if (turn.status === 'inProgress') return null;
   const prompts = [];
@@ -268,7 +336,7 @@ export function historyPair(turn) {
     if (item.type === 'functionCallOutput' && item.namespace === 'codex_app' &&
         ['create_thread', 'send_message_to_thread'].includes(item.name)) {
       const input = item.output?.text?.match(/^<codex_delegation>\s*<source_thread_id>[^<]+<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/);
-      if (input) prompts.push(input[1]);
+      if (input) prompts.push(delegationText(input[1]));
     }
     if (item.type === 'agentMessage' && item.text && (!item.phase || item.phase === 'final_answer')) replies.push(item.text);
   }
@@ -288,7 +356,7 @@ export function conversationEvents(turns) {
       } else if (item.type === 'functionCallOutput' && item.namespace === 'codex_app' &&
           ['create_thread', 'send_message_to_thread'].includes(item.name)) {
         const match = item.output?.text?.match(/^<codex_delegation>\s*<source_thread_id>([^<]+)<\/source_thread_id>\s*<input>([\s\S]*)<\/input>\s*<\/codex_delegation>\s*$/);
-        if (match) result.push({ key, text: match[2], role: 'user', caller: match[1], turnId: turn.id });
+        if (match) result.push({ key, text: delegationText(match[2]), role: 'user', caller: match[1], turnId: turn.id });
       } else if (item.type === 'agentMessage' && item.text) {
         // App Tools projects request_user_input_async as a final agent message with its call ID.
         const question = item.phase === 'final_answer' && item.id?.startsWith('call_');
@@ -313,6 +381,8 @@ export class Bridge {
     this.sendPersonal = sendPersonal;
     this.interrupt = interrupt;
     this.readProjectState = readProjectState;
+    this.readQuestion = pendingQuestion;
+    this.prepareQuestion = (id, questions, answer) => prepareQuestionReply(id, questions, answer, this.call);
     this.readErrors = new Map();
     this.creatingTopics = new Map();
     this.syncing = new Map();
@@ -327,6 +397,7 @@ export class Bridge {
     this.state.telegramPrompts ||= {};
     this.state.sources ||= {};
     this.state.attention ||= {};
+    this.state.awaitingQuestions ||= {};
     this.creatingChat = false;
   }
 
@@ -356,7 +427,8 @@ export class Bridge {
     return conversationEvents(turns).map(event => {
       if (event.turnId !== turnId) { origin = 'desktop'; turnId = event.turnId; }
       if (event.role === 'user') {
-        if (!this.state.sources[event.key] && !seen.has(event.key) && event.caller === this.config.callerThreadId) {
+        const receipt = event.text.startsWith('<send_user_message_question_reply>');
+        if (!this.state.sources[event.key] && !seen.has(event.key) && (event.caller === this.config.callerThreadId || receipt)) {
           const index = pending.indexOf(event.text);
           if (index >= 0) { pending.splice(index, 1); this.state.sources[event.key] = 'telegram'; }
         }
@@ -366,7 +438,7 @@ export class Bridge {
     });
   }
 
-  async deliver(threadId, event) {
+  async deliver(threadId, event, armQuestion = false) {
     const delivered = this.state.delivered[threadId] ||= [];
     if (delivered.includes(event.key)) return;
     if (event.role === 'user' && event.origin === 'telegram') {
@@ -384,6 +456,7 @@ export class Bridge {
       }
     } else await this.send((event.role === 'user' ? 'Bạn:\n' : '') + event.text, threadId);
     delivered.push(event.key);
+    if (armQuestion && event.question) this.state.awaitingQuestions[threadId] = event.key;
     this.persist();
   }
 
@@ -562,6 +635,7 @@ export class Bridge {
       }
       const id = destination(message, this.state);
       if (!this.state.threads[id]) return controlReply('Mở đúng topic của chat cần dừng, rồi gửi /cancel.');
+      delete this.state.awaitingQuestions[id];
       this.state.enabled[id] = true;
       this.persist();
       try {
@@ -638,12 +712,27 @@ export class Bridge {
     }
     try { text = await prompt(); }
     catch (error) { return controlReply('Chưa gửi ảnh vào Codex: ' + error.message + ' Gửi lại ảnh để thử lại.'); }
+    // Only a newly forwarded question arms one reply; history never intercepts ordinary prompts.
+    const callId = this.state.awaitingQuestions[id];
+    delete this.state.awaitingQuestions[id];
+    this.persist();
+    let submission;
+    if (callId) {
+      try {
+        const questions = this.readQuestion(id, callId);
+        if (questions) submission = await this.prepareQuestion(id, questions, text);
+      } catch (error) {
+        await controlReply('Chưa đóng được thẻ: ' + error.message + ' Vẫn gửi nguyên tin nhắn vào chat.');
+      }
+    }
+    text = submission?.prompt || text;
     // Persist intent before dispatch. Never replay an uncertain prompt on restart.
     this.state.pending = { updateId: update.update_id, threadId: id };
     (this.state.telegramPrompts[id] ||= []).push(text);
     this.persist();
     try {
-      const result = await this.call('send_message_to_thread', { threadId: id, hostId: 'local', prompt: text });
+      const result = submission ? await submission.send() :
+        await this.call('send_message_to_thread', { threadId: id, hostId: 'local', prompt: text });
       await this.send(result.message || 'Codex App đã nhận prompt.', id);
     } catch (error) {
       await this.send('Gửi chưa được xác nhận: ' + error.message + '\nBot không tự gửi lại. Kiểm tra chat trên máy trước khi gửi lại.', id);
@@ -685,7 +774,7 @@ export class Bridge {
         for (const event of all) {
           // Questions need attention even for desktop prompts; do not backfill old completed questions.
           const newQuestion = event.question && (event.activeQuestion || (prior && !prior.keys.includes(event.key)));
-          if (event.origin === 'telegram' || newQuestion) await this.deliver(id, event);
+          if (event.origin === 'telegram' || newQuestion) await this.deliver(id, event, !!newQuestion);
         }
         this.state.seen[id] = {
           turnId: turns[0]?.id,
