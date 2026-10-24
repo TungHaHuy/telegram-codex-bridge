@@ -398,6 +398,7 @@ export class Bridge {
     this.state.sources ||= {};
     this.state.attention ||= {};
     this.state.awaitingQuestions ||= {};
+    this.state.historyImported ||= {};
     this.creatingChat = false;
   }
 
@@ -464,6 +465,34 @@ export class Bridge {
     if (!this.syncing.has(threadId)) this.syncing.set(threadId, this.pullUpdate(threadId));
     try { return await this.syncing.get(threadId); }
     finally { this.syncing.delete(threadId); }
+  }
+
+  async importRecentHistory(threadId) {
+    if (this.state.historyImported[threadId]) return;
+    const pairs = [];
+    let cursor;
+    do {
+      const result = await this.call('read_thread', {
+        threadId, hostId: 'local', turnLimit: 1, includeOutputs: true,
+        maxOutputCharsPerItem: 20000, ...(cursor ? { cursor } : {}),
+      });
+      for (const turn of result.turns || []) {
+        const pair = historyPair(turn);
+        if (pair) pairs.push(pair);
+      }
+      cursor = result.page?.nextCursor;
+    } while (cursor && pairs.length < 5);
+    for (const { turn } of pairs.slice(0, 5).reverse()) {
+      const finalIds = new Set(turn.items.filter(i => i.type === 'agentMessage' &&
+        (!i.phase || i.phase === 'final_answer')).map(i => i.id));
+      for (const event of conversationEvents([turn])) {
+        if (event.role === 'user' || finalIds.has(event.key) || event.key === turn.id + ':error') {
+          await this.deliver(threadId, { ...event, origin: 'desktop' });
+        }
+      }
+    }
+    this.state.historyImported[threadId] = true;
+    this.persist();
   }
 
   async pullUpdate(threadId) {
@@ -610,6 +639,7 @@ export class Bridge {
       await this.send(this.state.topicMode ?
         'Topic này nối với chat Codex cùng tên. Nhắn ngay trong topic để gửi prompt hoặc steer.' :
         'Đã chọn. Nhắn bình thường để gửi vào chat này; Reply để chọn theo tin.', id);
+      await this.importRecentHistory(id);
       return;
     }
     // Topic-created/renamed service messages aren't prompts.

@@ -421,6 +421,23 @@ assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 7, 'walk
 const imported = historyMessages.filter(m => m.method === 'sendMessage').map(m => m.args.text);
 assert.deepEqual(imported.filter(text => /^response/.test(text)), [3,4,5,6,7].map(n => 'response ' + n));
 assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG'));
+// Explicit selection imports five completed pairs independently of /update's anchor.
+const selectMessages = [];
+const selectionHistory = new Bridge({ ownerId: owner }, { threads: { A: t }, routes: {}, seen: {} },
+  async (tool, args) => {
+    assert.equal(tool, 'read_thread');
+    const index = Number(args.cursor || 0);
+    return { turns: [historyTurns[index]], page: { nextCursor: String(index + 1) } };
+  }, async (method, args) => { selectMessages.push({ method, args }); return { message_id: selectMessages.length }; }, () => {});
+await selectionHistory.handle({ callback_query: { id: 'choose', data: 'A', from: { id: owner },
+  message: { chat: { id: owner, type: 'private' } } } });
+assert.deepEqual(selectMessages.filter(m => /^\[Chat A\]\nresponse/.test(m.args.text || '')).map(m => m.args.text),
+  [3,4,5,6,7].map(n => '[Chat A]\nresponse ' + n));
+assert.equal(selectMessages.filter(m => m.args.text?.includes('Bạn:\nprompt')).length, 5);
+const beforeReselect = selectMessages.length;
+await selectionHistory.importRecentHistory('A');
+assert.equal(selectMessages.length, beforeReselect, 'reselecting must not repeat imported history');
+assert(!selectMessages.some(m => m.args.text?.includes('PRIVATE_TOOL_LOG')));
 const historyCount = historyMessages.length;
 await historyBridge.scan();
 assert.equal(historyMessages.length, historyCount, 'desktop responses must not auto-forward after manual sync');

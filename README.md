@@ -13,11 +13,11 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
 - `/projects` → chọn project → **＋ New chat** và 5 chat gần nhất trong project.
 - Bấm New chat rồi gửi prompt đầu tiên để tạo chat trong đúng project.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
-- Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; mở topic
-  không tự nhập lịch sử và chat mới trên desktop không tự xuất hiện.
+- Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; chọn chat
+  từ menu nhập 5 lượt hỏi–đáp gần nhất một lần, chat mới trên desktop không tự xuất hiện.
 - Nhắn trong topic để gửi prompt hoặc steer; phản hồi/lỗi từ prompt Telegram tự về.
 - `/update` lấy phần desktop chưa gửi, chỉ sau prompt Telegram gần nhất của chat.
-  Chưa có prompt Telegram thì chưa nhập lịch sử. Prompt Telegram tự cập nhật.
+  Chưa có prompt Telegram thì `/update` chưa nhập tin desktop. Prompt Telegram tự cập nhật.
 - Báo ngay khi chat được chọn chờ cấp quyền hoặc chờ bạn trả lời trong App.
 - Câu hỏi lựa chọn của Codex được chuyển ngay với đầy đủ nội dung/lựa chọn,
   kể cả prompt đến từ desktop và lượt chat vẫn đang chạy; không cần `/update`.
@@ -114,7 +114,8 @@ không bị lựa chọn chat cũ hoặc Reply sang chat khác ghi đè.
 
 ## Hiển thị lịch sử đúng người gửi
 
-Chọn chat chỉ tạo/mở topic. Dùng `/update` để lấy phần mới từ prompt trên desktop,
+Chọn chat từ menu tạo/mở topic và nhập một lần 5 lượt hỏi–đáp hoàn tất gần nhất.
+Dùng `/update` để lấy phần mới từ prompt trên desktop,
 từ sau prompt Telegram gần nhất, theo thứ tự cũ đến mới, gồm prompt, lời trả lời/
 progress đã chốt và lỗi. Phần đang stream,
 reasoning và log công cụ không được chuyển. Tin đã gửi không được nhập lại.
@@ -253,6 +254,9 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
 - Menu liệt kê 50 chat local gần nhất và chat ghim. Chỉ chat được chọn hoặc được
   nhắn trong topic mới được theo dõi. Topic tự tạo từ bản cũ giữ nguyên nhưng
   không tự theo dõi lại; chat được chọn gần nhất được giữ khi nâng cấp.
+- Khi chọn chat cũ từ menu, bot nhập một lần 5 lượt hỏi–đáp hoàn tất gần nhất,
+  theo thứ tự cũ đến mới. Bỏ lượt đang chạy và log công cụ; phần đã gửi không
+  bị lặp khi chọn lại. Bước nhập lịch sử này độc lập với mốc của `/update`.
 - Nguồn Telegram được nhận diện bằng prompt đã ghi trước khi gửi và item trả về
   từ App. Khi steer một lượt desktop từ Telegram, phần sau prompt steer tự cập nhật;
   phần desktop trước prompt đó nằm ngoài phạm vi `/update` và không nhập lại.
