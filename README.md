@@ -16,6 +16,12 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
 - Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; chọn chat
   từ menu nhập 5 lượt hỏi–đáp gần nhất một lần, chat mới trên desktop không tự xuất hiện.
 - Nhắn trong topic để gửi prompt hoặc steer; phản hồi/lỗi từ prompt Telegram tự về.
+- Đường dẫn file local trong phản hồi được thay bằng file đính kèm, xen giữa
+  các đoạn chữ theo đúng thứ tự. Hỗ trợ link Markdown, đường dẫn trong backtick
+  và đường dẫn Windows thông thường; link web giữ nguyên. File không tồn tại,
+  vượt 50 MB hoặc gửi lỗi sẽ hiện đường dẫn kèm lý do. Bot không tự gửi file
+  `.env`, dữ liệu đăng nhập/runtime riêng hay thư mục; artifact trong
+  `.codex/visualizations` vẫn được phép gửi.
 - `/update` lấy phần desktop chưa gửi, chỉ sau prompt Telegram gần nhất của chat.
   Chưa có prompt Telegram thì `/update` chưa nhập tin desktop. Prompt Telegram tự cập nhật.
 - Báo ngay khi chat được chọn chờ cấp quyền hoặc chờ bạn trả lời trong App.

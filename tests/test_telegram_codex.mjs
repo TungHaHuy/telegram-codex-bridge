@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, quotaText, historyPair } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, quotaText, historyPair, localFileParts, telegramFileBody } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
@@ -45,6 +45,52 @@ await bridge.handle({ update_id: 4, message: msg });
 assert.equal(calls.length, 2, 'uncertain dispatch must not retry');
 assert(sent.at(-1).text.includes('không tự gửi lại'));
 assert.equal(state.pending, undefined);
+
+const linked = localFileParts('Before [Report](<D:/work/My report (1).pdf:12>) after `D:\\work\\data.csv` and https://example.com/file.pdf');
+assert.equal(linked[1].file, 'D:/work/My report (1).pdf');
+assert.equal(linked[3].file, 'D:\\work\\data.csv');
+assert.equal(localFileParts('See D:/work/test.zip now')[1].file, 'D:/work/test.zip');
+assert.equal(localFileParts('![preview](/D:/work/image.png)')[0].file, 'D:/work/image.png');
+const fileSends = [];
+const fileState = { topicMode: true, enabled: { A: true }, topics: { A: 101 }, threads: { A: { title: 'A' } }, routes: {}, seen: {} };
+const fileBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, fileState, () => assert.fail('sending files must not dispatch prompts'),
+  async (method, args) => { fileSends.push({ method, args }); return { message_id: fileSends.length }; }, () => {});
+await fileBridge.deliver('A', { key: 'file-output', role: 'assistant', origin: 'telegram', text: 'Before [report](D:/work/report.pdf) After' });
+assert.deepEqual(fileSends.map(c => c.method), ['sendMessage', 'sendDocument', 'sendMessage']);
+assert(fileSends.every(c => c.args.message_thread_id === 101 && c.args.chat_id === -1001234));
+assert.equal(fileState.routes['-1001234:2'], 'A', 'file messages retain Reply routing');
+await fileBridge.deliver('A', { key: 'file-output', role: 'assistant', text: '[report](D:/work/report.pdf)' });
+assert.equal(fileSends.length, 3, 'do not upload an already delivered response twice');
+fileBridge.telegram = async (method, args) => {
+  if (method === 'sendDocument') throw new Error('upload failed');
+  fileSends.push({ method, args }); return { message_id: fileSends.length };
+};
+await fileBridge.deliver('A', { key: 'missing-file', role: 'assistant', text: '[missing](D:/work/missing.pdf)' });
+assert(fileSends.at(-1).args.text.includes('D:/work/missing.pdf'));
+assert(fileSends.at(-1).args.text.includes('upload failed'));
+const fileTestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-upload-'));
+try {
+  const file = path.join(fileTestDir, 'sample.txt');
+  fs.writeFileSync(file, 'FILE_BYTES_OK');
+  const form = await telegramFileBody({ chat_id: 123, message_thread_id: 101, document: file, caption: 'sample' });
+  assert.equal(await form.get('document').text(), 'FILE_BYTES_OK');
+  assert.equal(form.get('document').name, 'sample.txt');
+  assert.equal(form.get('message_thread_id'), '101');
+  fs.writeFileSync(path.join(fileTestDir, '.env'), 'PRIVATE');
+  await assert.rejects(telegramFileBody({ document: path.join(fileTestDir, '.env') }), /riêng tư/);
+  fs.mkdirSync(path.join(fileTestDir, '.telegram-codex'));
+  const tokenFile = path.join(fileTestDir, '.telegram-codex', 'config.json');
+  fs.writeFileSync(tokenFile, '{}');
+  await assert.rejects(telegramFileBody({ document: tokenFile }), /riêng tư/);
+  await assert.rejects(telegramFileBody({ document: path.join(fileTestDir, 'missing.pdf') }), /ENOENT/);
+  await assert.rejects(telegramFileBody({ document: fileTestDir }), /không phải file/);
+  const large = path.join(fileTestDir, 'large.bin');
+  fs.writeFileSync(large, ''); fs.truncateSync(large, 50 * 1024 * 1024 + 1);
+  await assert.rejects(telegramFileBody({ document: large }), /50 MB/);
+} finally {
+  assert(path.resolve(fileTestDir).startsWith(path.resolve(os.tmpdir()) + path.sep));
+  fs.rmSync(fileTestDir, { recursive: true });
+}
 
 // A displayed question must never divert a new prompt to a window-owner-only route.
 const ownerlessCalls = [];

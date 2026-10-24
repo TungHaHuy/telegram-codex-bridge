@@ -324,6 +324,43 @@ function delegationText(text) {
   return text.replace(/&(amp|lt|gt|quot|apos);/g, (_, name) => entities[name]);
 }
 
+export function localFileParts(text) {
+  const pattern = /!?\[([^\]\n]*)\]\(<?(\/?[A-Za-z]:[\\/](?:[^()\n]|\([^()\n]*\))*?)>?\)|`([A-Za-z]:[\\/][^`\n]+)`|([A-Za-z]:[\\/][^\s`<>"|]*\.[A-Za-z0-9]{1,10})(?=[\s,;!?)]|$)/g;
+  const parts = [];
+  let end = 0;
+  for (const match of text.matchAll(pattern)) {
+    let file = match[2] || match[3] || match[4];
+    if (!match[2] && !path.win32.extname(file)) continue;
+    if (file.startsWith('/')) file = file.slice(1);
+    file = file.replace(/:\d+(?::\d+)?$/, '');
+    try { file = decodeURI(file); } catch { /* Keep literal filenames with %. */ }
+    if (match.index > end) parts.push({ text: text.slice(end, match.index) });
+    parts.push({ file, label: match[1] || path.win32.basename(file), original: match[0] });
+    end = match.index + match[0].length;
+  }
+  if (end < text.length) parts.push({ text: text.slice(end) });
+  return parts;
+}
+
+export async function telegramFileBody(body) {
+  const file = fs.realpathSync(body.document);
+  const segments = file.replace(/\\/g, '/').split('/');
+  if (segments.some((s, i) => /^\.env(?:\.|$)/i.test(s) ||
+      ['.telegram-codex', '.git', '.aws', '.ssh'].includes(s.toLowerCase()) ||
+      (s.toLowerCase() === '.codex' && segments[i + 1]?.toLowerCase() !== 'visualizations'))) {
+    throw new Error('Không tự gửi file cấu hình/đăng nhập riêng tư.');
+  }
+  const stat = fs.statSync(file);
+  if (!stat.isFile()) throw new Error('Đường dẫn không phải file.');
+  if (stat.size > 50 * 1024 * 1024) throw new Error('File vượt giới hạn gửi 50 MB.');
+  const form = new FormData();
+  for (const [key, value] of Object.entries(body)) {
+    if (key === 'document') form.set(key, await fs.openAsBlob(file), path.basename(file));
+    else if (value != null) form.set(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
+  }
+  return form;
+}
+
 export function historyPair(turn) {
   if (turn.status === 'inProgress') return null;
   const prompts = [];
@@ -455,7 +492,7 @@ export class Bridge {
         delete this.state.historyPending[pendingKey];
         this.persist();
       }
-    } else await this.send((event.role === 'user' ? 'Bạn:\n' : '') + event.text, threadId);
+    } else await this.send((event.role === 'user' ? 'Bạn:\n' : '') + event.text, threadId, {}, event.role === 'assistant');
     delivered.push(event.key);
     if (armQuestion && event.question) this.state.awaitingQuestions[threadId] = event.key;
     this.persist();
@@ -524,16 +561,29 @@ export class Bridge {
     if (!count) await this.send('Chưa có tin mới từ prompt trên desktop.', threadId);
   }
 
-  async send(text, threadId, extra = {}) {
+  async send(text, threadId, extra = {}, attachFiles = false) {
     const topicId = threadId && this.state.topicMode ? await this.topic(threadId) : null;
     if (threadId && !this.state.topicMode) text = '[' + this.state.threads[threadId].title + ']\n' + text;
-    for (const part of chunks(text)) {
-      const sent = await this.telegram('sendMessage', {
-        chat_id: this.config.chatId || this.config.ownerId, text: part, ...extra,
-        ...(topicId ? { message_thread_id: topicId } : {}),
-      });
-      if (threadId) this.state.routes[(extra.chat_id || this.config.chatId || this.config.ownerId) + ':' + sent.message_id] = threadId;
-      this.persist();
+    const destination = { chat_id: this.config.chatId || this.config.ownerId, ...extra,
+      ...(topicId ? { message_thread_id: topicId } : {}) };
+    const parts = attachFiles ? localFileParts(text) : [{ text }];
+    for (const part of parts) {
+      if (part.file) {
+        try {
+          const sent = await this.telegram('sendDocument', { ...destination, document: part.file, caption: part.label.slice(0, 1024) });
+          if (threadId) this.state.routes[destination.chat_id + ':' + sent.message_id] = threadId;
+          this.persist();
+          continue;
+        } catch (error) {
+          part.text = part.original + '\nChưa gửi được file: ' + error.message;
+        }
+      }
+      for (const chunk of chunks(part.text || '')) {
+        if (!chunk.trim()) continue;
+        const sent = await this.telegram('sendMessage', { ...destination, text: chunk });
+        if (threadId) this.state.routes[(extra.chat_id || this.config.chatId || this.config.ownerId) + ':' + sent.message_id] = threadId;
+        this.persist();
+      }
     }
   }
 
@@ -823,9 +873,12 @@ export class Bridge {
 }
 
 async function telegram(token, method, body) {
+  const upload = method === 'sendDocument' && typeof body.document === 'string' && /^[A-Za-z]:[\\/]/.test(body.document);
   const response = await fetch('https://api.telegram.org/bot' + token + '/' + method, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-    signal: AbortSignal.timeout(45000),
+    method: 'POST', ...(upload ? { body: await telegramFileBody(body) } : {
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }),
+    signal: AbortSignal.timeout(upload ? 180000 : 45000),
   });
   const data = await response.json();
   if (!data.ok) {
