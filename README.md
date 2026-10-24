@@ -8,10 +8,13 @@ bên dưới. Không cần OpenAI API key, server công khai hay tunnel.
 Đây là cầu nối tự viết, dùng các công cụ của Codex App đang mở. Máy và Codex App
 phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Codex.
 
+Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
+
 ## Chức năng
 
 - `/projects` → chọn project → **＋ New chat** và 5 chat gần nhất trong project.
-- Bấm New chat rồi gửi prompt đầu tiên để tạo chat trong đúng project.
+- Bấm New chat → nhập tên chat → gửi prompt đầu tiên để tạo chat trong đúng project.
+  Tin nhập tên chưa chạy model; prompt đầu tiên có thể kèm ảnh hoặc file.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
 - Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; chọn chat
   từ menu nhập 5 lượt hỏi–đáp gần nhất một lần, chat mới trên desktop không tự xuất hiện.
@@ -29,8 +32,18 @@ phải chạy thì bot mới hoạt động. Tắt bot không xóa các chat Cod
   kể cả prompt đến từ desktop và lượt chat vẫn đang chạy; không cần `/update`.
   Phản hồi desktop thông thường vẫn chờ `/update` như trước.
 - `/cancel` dừng đúng lượt đang chạy trong topic hiện tại.
-- Gửi ảnh Photo hoặc file PNG/JPEG/WebP, có thể kèm caption làm yêu cầu.
+- Gửi ảnh Photo hoặc tài liệu dưới dạng Document, có thể kèm caption làm yêu cầu.
 - `/quota` xem hạn mức tài khoản và thời điểm reset theo giờ Việt Nam.
+- `/start` bật Codex; `/restart` tắt rồi mở lại đúng gói Codex trên máy (có thể
+  ngắt các lượt đang chạy). Bot vẫn nhận lệnh khi Codex chưa mở.
+- `/model` đổi model cho các lượt tiếp theo của chat trong topic hiện tại.
+  Menu đọc danh mục model hiện có của Codex và xác nhận lại cài đặt sau khi đổi.
+- `/effort` chọn mức suy nghĩ model hiện tại hỗ trợ, giữ nguyên model và áp dụng
+  từ lượt tiếp theo. Menu cũ không dùng được nếu model đã đổi.
+- Yêu cầu cấp quyền được hỗ trợ có nút cho phép/từ chối ngay trong topic. Chỉ
+  chủ bot được chọn, quyết định gắn với đúng nội dung yêu cầu đang chờ. Login,
+  OTP, xác minh danh tính và form khác vẫn làm trong App.
+- Phản hồi chốt có `[end]` ở cuối; tin tiến độ và câu hỏi không có marker này.
 
 ## Yêu cầu
 
@@ -166,6 +179,10 @@ bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượ
 | Lệnh | Tác dụng |
 | --- | --- |
 | `/projects` | Menu project → New chat và 5 chat gần nhất |
+| `/start` | Bật Codex nếu chưa chạy, kiểm tra App sẵn sàng |
+| `/restart` | Dừng cây tiến trình Codex và mở lại; có thể ngắt công việc đang chạy |
+| `/model` | Menu model cho chat trong topic hiện tại, áp dụng lượt tiếp theo |
+| `/effort` | Chọn mức suy nghĩ được model hiện tại hỗ trợ, giữ nguyên model |
 | `/chats` | Chọn chat local có sẵn, tạo/mở topic nếu đang dùng Topics |
 | `/status` | Xem trạng thái chat của topic hoặc chat đang chọn |
 | `/quota` | Xem hạn mức tài khoản, giờ reset và credit khi App cung cấp |
@@ -176,12 +193,18 @@ bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượ
 Trong nhóm dùng được cả `/projects` và `/projects@ten_bot_cua_ban`;
 các lệnh khác cũng nhận hậu tố đúng tên bot.
 
-Gửi ảnh ngay trong topic. Caption trở thành yêu cầu; ảnh không caption dùng yêu
-cầu mặc định xem/phân tích ảnh. Ảnh cũng có thể là prompt đầu tiên sau New chat.
+Gửi ảnh hoặc file ngay trong topic. Caption trở thành yêu cầu; ảnh không caption
+dùng yêu cầu mặc định xem/phân tích ảnh, Document dùng yêu cầu đọc/phân tích file.
+Sau New chat, nhập tên một dòng tối đa 80 ký tự trước, rồi mới gửi ảnh/file hoặc
+prompt đầu tiên. `/cancel` hủy được ở cả hai bước; lỗi tải giữ nguyên tên đã nhập.
 File tải xuống được kiểm tra định dạng và lưu dưới tên ngẫu nhiên trong
 `.telegram-codex/inbox/`. Codex nhận đường dẫn và mở ảnh bằng `view_image`,
 vì công cụ gửi prompt của App hiện chỉ nhận văn bản. Không thay ảnh bằng OCR.
-Giới hạn tải là 20 MB/ảnh theo Bot API; chưa gom album thành một prompt.
+Giới hạn tải là 20 MiB/file theo Bot API; chưa gom album thành một prompt.
+Document giữ phần mở rộng trong tên lưu riêng tại inbox. Codex nhận đường dẫn
+và dùng công cụ phù hợp để đọc; bridge không tự chạy file. Việc đọc từng định
+dạng còn phụ thuộc công cụ có trên máy. Voice/video chưa được nhận bằng loại
+tin riêng; có thể gửi chúng dưới dạng Document.
 
 ## Dừng, chạy lại và kiểm tra
 
@@ -268,7 +291,8 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   phần desktop trước prompt đó nằm ngoài phạm vi `/update` và không nhập lại.
   Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
 - Chờ quyền được phát hiện bằng trạng thái `waitingOnApproval`, kiểm tra mỗi 3 giây.
-  Bot báo một lần mỗi đợt chờ. Duyệt và xem chi tiết yêu cầu trong Codex App.
+  Bot gửi nội dung và nút quyết định cho loại yêu cầu đã hỗ trợ; các loại khác
+  vẫn báo để xem và xử lý trong Codex App.
 - Câu hỏi `request_user_input_async` được App Tools trả như agent message đã chốt
   với call ID; không áp dụng bộ lọc streaming/desktop cho câu hỏi mới hoặc đang
   diễn ra. Mốc đã gửi chống lặp; không nhập lại câu hỏi lịch sử đã hoàn tất khi
@@ -287,7 +311,7 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
 - Nếu gửi prompt hoặc tạo chat mất kết nối, kiểm tra Codex trước khi gửi lại:
   bot không tự lặp thao tác chưa rõ kết quả. Thông báo Telegram vẫn có thể lặp
   nếu mạng đứt ngay sau khi Telegram nhận tin.
-- Chỉ chat/project Codex local; chưa hỗ trợ chat cloud, video/audio đầu vào,
+- Chỉ chat/project Codex local; chưa hỗ trợ chat cloud, tin voice/video trực tiếp,
   gom album hoặc tự bật nguồn máy. Không có lệnh tắt máy.
 
 Tài liệu nền: [Telegram Bot API](https://core.telegram.org/bots/api),

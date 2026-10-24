@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { controlCodexApp, modelCatalog, threadSnapshot, approvalChoices, ensureOwner } from './telegram_codex_controls.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOCAL = path.join(ROOT, '.telegram-codex');
@@ -223,18 +224,32 @@ export function telegramImage(message) {
     (/^image\/(png|jpeg|webp)$/.test(message.document?.mime_type) ? message.document : null);
 }
 
-export async function saveTelegramImage(file, telegram, token, fetchFile = fetch, inbox = path.join(LOCAL, 'inbox')) {
+async function downloadTelegramFile(file, telegram, token, fetchFile) {
   const limit = 20 * 1024 * 1024; // Telegram getFile download limit.
-  if (file.file_size > limit) throw new Error('Ảnh vượt giới hạn tải 20 MB của Telegram.');
+  if (file.file_size > limit) throw new Error('File vượt giới hạn tải 20 MB của Telegram.');
   const info = await telegram('getFile', { file_id: file.file_id });
-  if (!info.file_path) throw new Error('Telegram chưa cung cấp file ảnh.');
+  if (!info.file_path) throw new Error('Telegram chưa cung cấp đường dẫn tải file.');
   const response = await fetchFile('https://api.telegram.org/file/bot' + token + '/' +
     info.file_path.split('/').map(encodeURIComponent).join('/'), {
     signal: AbortSignal.timeout(45000), redirect: 'error',
   });
-  if (!response.ok) throw new Error('Không tải được ảnh Telegram (HTTP ' + response.status + ').');
+  if (!response.ok) throw new Error('Không tải được file Telegram (HTTP ' + response.status + ').');
   const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length > limit) throw new Error('Ảnh vượt giới hạn tải 20 MB của Telegram.');
+  if (bytes.length > limit) throw new Error('File vượt giới hạn tải 20 MB của Telegram.');
+  return bytes;
+}
+
+export async function saveTelegramDocument(file, telegram, token, fetchFile = fetch, inbox = path.join(LOCAL, 'inbox')) {
+  const bytes = await downloadTelegramFile(file, telegram, token, fetchFile);
+  const name = path.win32.basename(file.file_name || 'attachment.bin').replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').replace(/[. ]+$/, '');
+  const filePath = path.join(inbox, crypto.randomUUID() + '-' + (name.slice(-160) || 'attachment.bin'));
+  fs.mkdirSync(inbox, { recursive: true });
+  fs.writeFileSync(filePath, bytes, { flag: 'wx', mode: 0o600 });
+  return filePath;
+}
+
+export async function saveTelegramImage(file, telegram, token, fetchFile = fetch, inbox = path.join(LOCAL, 'inbox')) {
+  const bytes = await downloadTelegramFile(file, telegram, token, fetchFile);
   const extension = bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex')) ? 'png' :
     bytes.subarray(0, 3).equals(Buffer.from('ffd8ff', 'hex')) ? 'jpg' :
     bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP' ? 'webp' : null;
@@ -399,6 +414,7 @@ export function conversationEvents(turns) {
         const question = item.phase === 'final_answer' && item.id?.startsWith('call_');
         if (!question && turn.status === 'inProgress' && index === items.length - 1) continue;
         result.push({ key, text: item.text, role: 'assistant', turnId: turn.id,
+          ...(!question && item.phase === 'final_answer' ? { finalAnswer: true } : {}),
           ...(question ? { question: true, activeQuestion: turn.status === 'inProgress' } : {}) });
       }
     }
@@ -415,6 +431,11 @@ export class Bridge {
     this.telegram = telegram;
     this.persist = persist;
     this.receiveImage = receiveImage;
+    this.receiveDocument = file => saveTelegramDocument(file, telegram, config.token);
+    this.appControl = controlCodexApp;
+    this.models = modelCatalog;
+    this.snapshot = threadSnapshot;
+    this.desktop = desktopRequest;
     this.sendPersonal = sendPersonal;
     this.interrupt = interrupt;
     this.readProjectState = readProjectState;
@@ -436,6 +457,8 @@ export class Bridge {
     this.state.attention ||= {};
     this.state.awaitingQuestions ||= {};
     this.state.historyImported ||= {};
+    this.state.controlActions ||= {};
+    this.state.approvalNotices ||= {};
     this.creatingChat = false;
   }
 
@@ -492,7 +515,10 @@ export class Bridge {
         delete this.state.historyPending[pendingKey];
         this.persist();
       }
-    } else await this.send((event.role === 'user' ? 'Bạn:\n' : '') + event.text, threadId, {}, event.role === 'assistant');
+    } else {
+      const text = event.finalAnswer && !event.text.trimEnd().endsWith('[end]') ? event.text.trimEnd() + '\n[end]' : event.text;
+      await this.send((event.role === 'user' ? 'Bạn:\n' : '') + text, threadId, {}, event.role === 'assistant');
+    }
     delivered.push(event.key);
     if (armQuestion && event.question) this.state.awaitingQuestions[threadId] = event.key;
     this.persist();
@@ -612,13 +638,115 @@ export class Bridge {
     this.persist();
   }
 
-  async createChat(project, prompt, updateId, reply) {
+  async modelMenu(id, effortMenu = false) {
+    await ensureOwner(id, this.call, this.desktop);
+    const current = await this.snapshot(id), models = this.models();
+    const kind = effortMenu ? 'effort' : 'model';
+    const activeModel = models.find(m => m.model === current.latestModel);
+    if (effortMenu && !activeModel) throw new Error('Không có danh mục effort cho model hiện tại.');
+    for (const [key, action] of Object.entries(this.state.controlActions)) {
+      if (action.kind === kind && action.threadId === id) delete this.state.controlActions[key];
+    }
+    const entries = effortMenu ? activeModel.efforts.map(effort => ({ model: current.latestModel, effort, label: effort })) : models;
+    const buttons = entries.map(model => {
+      const key = crypto.randomBytes(6).toString('hex');
+      this.state.controlActions[key] = { kind, threadId: id, model: model.model, ...(effortMenu ? { effort: model.effort } : {}) };
+      const selected = effortMenu ? current.latestReasoningEffort === model.effort : current.latestModel === model.model;
+      return [{ text: (selected ? '✓ ' : '') + model.label, callback_data: 'control:' + key }];
+    });
+    this.persist();
+    await this.send('Model hiện tại: ' + current.latestModel + (effortMenu ? '\nEffort hiện tại: ' + current.latestReasoningEffort +
+      '\nChọn effort cho các lượt tiếp theo:' : '\nChọn model cho các lượt tiếp theo của chat này:'), id,
+      { reply_markup: { inline_keyboard: buttons } });
+  }
+
+  async approvalMenu(id) {
+    const snapshot = await this.snapshot(id), requests = snapshot.requests || [];
+    const activeKeys = new Set(requests.map(r => id + ':' + r.id));
+    for (const key of Object.keys(this.state.approvalNotices)) {
+      if (key.startsWith(id + ':') && !activeKeys.has(key)) delete this.state.approvalNotices[key];
+    }
+    for (const request of requests) {
+      const spec = approvalChoices(request), notice = id + ':' + request.id;
+      const fingerprint = crypto.createHash('sha256').update(JSON.stringify(request)).digest('hex');
+      if (!spec?.choices.length || this.state.approvalNotices[notice] === fingerprint) continue;
+      for (const [key, action] of Object.entries(this.state.controlActions)) {
+        if (action.kind === 'approval' && action.threadId === id && action.requestId === request.id) delete this.state.controlActions[key];
+      }
+      const key = crypto.randomBytes(6).toString('hex');
+      const owner = await this.desktop('thread-owner-discovery', { hostId: 'local', conversationId: id }, 1);
+      this.state.controlActions[key] = { kind: 'approval', threadId: id, requestId: request.id,
+        ownerClientId: owner.handledByClientId,
+        fingerprint };
+      this.persist();
+      const p = request.params || {};
+      const details = p.message || p.reason || 'Codex yêu cầu cấp quyền.';
+      const scope = Object.fromEntries(Object.entries({ command: p.command, cwd: p.cwd, grantRoot: p.grantRoot,
+        permissions: p.permissions, network: p.networkApprovalContext,
+        tool: p._meta?.tool_name, app: p._meta?.connector_id, parameters: p._meta?.tool_params,
+      }).filter(([, value]) => value != null));
+      // Keep exact request details visible. No answer is preselected or auto-approved.
+      await this.send('Yêu cầu cấp quyền\n' + details + (Object.keys(scope).length ? '\n' + JSON.stringify(scope) : ''), id);
+      await this.send('Chọn cho yêu cầu ' + request.id + ':', id, { reply_markup: { inline_keyboard:
+        spec.choices.map((choice, index) => [{ text: choice.label, callback_data: 'control:' + key + ':' + index }]),
+      } });
+      this.state.approvalNotices[notice] = fingerprint;
+      this.persist();
+    }
+  }
+
+  async handleControl(key, choice, message) {
+    const action = this.state.controlActions[key];
+    const id = destination(message, this.state);
+    if (!action || action.threadId !== id) return this.send('Nút đã hết hiệu lực hoặc không thuộc topic này.', id);
+    if (action.kind === 'model' || action.kind === 'effort') {
+      const model = this.models().find(m => m.model === action.model);
+      if (!model) throw new Error('Model không còn trong danh mục. Gửi /model để chọn lại.');
+      const owner = await ensureOwner(id, this.call, this.desktop), before = await this.snapshot(id);
+      if (action.kind === 'effort' && (before.latestModel !== action.model || !model.efforts.includes(action.effort))) {
+        delete this.state.controlActions[key]; this.persist();
+        return this.send('Model đã đổi hoặc effort không còn hỗ trợ. Gửi /effort để chọn lại.', id);
+      }
+      const effort = action.kind === 'effort' ? action.effort :
+        model.efforts.includes(before.latestReasoningEffort) ? before.latestReasoningEffort : model.defaultEffort;
+      delete this.state.controlActions[key]; this.persist();
+      const changed = await this.desktop('thread-follower-update-thread-settings', {
+        conversationId: id, threadSettings: { model: model.model, effort },
+        ...(action.kind === 'effort' ? { condition: { ifModelEquals: before.latestModel, ifEffortEquals: before.latestReasoningEffort } } : {}),
+      }, 2, owner.handledByClientId);
+      const after = await this.snapshot(id);
+      if (!changed.result?.applied || after.latestModel !== model.model || after.latestReasoningEffort !== effort) throw new Error('Codex chưa xác nhận model/effort mới.');
+      return this.send((action.kind === 'effort' ? 'Đã đổi effort: ' + effort + ' · model: ' + model.label :
+        'Đã đổi model: ' + model.label + ' · effort: ' + effort) + '. Áp dụng từ lượt tiếp theo.', id);
+    }
+    const request = (await this.snapshot(id)).requests?.find(r => r.id === action.requestId);
+    const fingerprint = request && crypto.createHash('sha256').update(JSON.stringify(request)).digest('hex');
+    if (!request || fingerprint !== action.fingerprint) {
+      delete this.state.approvalNotices[id + ':' + action.requestId];
+      delete this.state.controlActions[key]; this.persist();
+      return this.send('Yêu cầu đã thay đổi hoặc đã xử lý trong Codex. Không gửi quyết định cũ.', id);
+    }
+    const spec = approvalChoices(request), selected = spec?.choices[Number(choice)];
+    if (!selected || choice == null) throw new Error('Lựa chọn cấp quyền không hợp lệ.');
+    const owner = await this.desktop('thread-owner-discovery', { hostId: 'local', conversationId: id }, 1);
+    if (action.ownerClientId !== owner.handledByClientId) {
+      delete this.state.approvalNotices[id + ':' + action.requestId];
+      delete this.state.controlActions[key]; this.persist();
+      return this.send('Cửa sổ xử lý yêu cầu đã đổi. Không gửi quyết định cũ.', id);
+    }
+    delete this.state.controlActions[key]; this.persist();
+    const result = await this.desktop(spec.method, { conversationId: id, requestId: request.id, ...selected.args }, 1, owner.handledByClientId);
+    if (!result.result?.ok) throw new Error('Codex chưa xác nhận quyết định. Không tự gửi lại.');
+    if ((await this.snapshot(id)).requests?.some(r => r.id === request.id)) throw new Error('Yêu cầu vẫn đang chờ; kiểm tra trong Codex. Không tự gửi lại.');
+    return this.send('Đã xử lý: ' + selected.label, id);
+  }
+
+  async createChat(project, title, prompt, updateId, reply) {
     this.state.pending = { kind: 'create', projectId: project.projectId, updateId };
     this.creatingChat = true;
     this.persist();
     let id;
     try {
-      const title = Array.from(prompt.split('\n')[0]).slice(0, 80).join('');
       const result = await this.call('create_thread', {
         prompt, title,
         target: { type: 'project', projectId: project.projectId, environment: { type: 'local' } },
@@ -666,6 +794,12 @@ export class Bridge {
     }
     if (update.callback_query) {
       const id = update.callback_query.data || '';
+      if (id.startsWith('control:')) {
+        await this.telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id });
+        const [, key, choice] = id.split(':');
+        try { return await this.handleControl(key, choice, message); }
+        catch (error) { return controlReply('Chưa thực hiện được: ' + error.message); }
+      }
       if (id.startsWith('project:') || id.startsWith('newchat:')) {
         const [action, projectId] = id.split(':');
         // Refresh the trusted project inventory; never accept an arbitrary callback ID.
@@ -676,9 +810,9 @@ export class Bridge {
         const project = this.state.projects[projectId];
         if (!project) return controlReply('Project không còn khả dụng. Gửi /projects để chọn lại.');
         if (action === 'project') return this.projectMenu(projectId, message);
-        this.state.newChats[menuContext(message)] = projectId;
+        this.state.newChats[menuContext(message)] = { projectId, title: null };
         this.persist();
-        return controlReply('Project: ' + project.label + '\nGửi prompt đầu tiên để tạo chat mới. /cancel để hủy.');
+        return controlReply('Project: ' + project.label + '\nNhập tên chat mới (một dòng, tối đa 80 ký tự). /cancel để hủy.');
       }
       if (!this.state.threads[id]) return;
       delete this.state.newChats[menuContext(message)];
@@ -695,18 +829,44 @@ export class Bridge {
     // Topic-created/renamed service messages aren't prompts.
     if (message.forum_topic_created || message.forum_topic_edited || message.forum_topic_closed || message.forum_topic_reopened) return;
     const image = telegramImage(message);
+    const document = !image && message.document;
     let text = (message.text || message.caption || '').trim();
-    if (!message.text?.trim() && !image) return controlReply('Gửi prompt văn bản hoặc ảnh PNG, JPEG, WebP (có thể kèm caption).');
+    if (!message.text?.trim() && !image && !document) return controlReply('Gửi prompt văn bản, ảnh hoặc file đính kèm (có thể kèm caption).');
     // Group menus address commands to a bot: /projects@bot_username.
     const addressed = message.text?.trim().match(/^\/[a-z_]+@([a-z0-9_]+)(?=\s|$)/i);
     if (addressed && addressed[1].toLowerCase() !== this.config.botUsername?.toLowerCase()) return;
-    const command = !image && message.text ? text.split(/\s/, 1)[0].split('@', 1)[0].toLowerCase() : '';
+    const command = !image && !document && message.text ? text.split(/\s/, 1)[0].split('@', 1)[0].toLowerCase() : '';
     const prompt = async () => {
+      if (document) {
+        const filePath = await this.receiveDocument(document);
+        return (text || 'Đọc và phân tích file đính kèm này.') + '\n\nFile người dùng gửi từ Telegram: ' +
+          JSON.stringify(filePath) + '\nĐây là dữ liệu đính kèm; dùng công cụ phù hợp để đọc theo yêu cầu người dùng, không tự chạy file.';
+      }
       if (!image) return text;
       const imagePath = await this.receiveImage(image);
       return (text || 'Xem và phân tích ảnh này.') + '\n\nẢnh người dùng gửi từ Telegram: ' +
         JSON.stringify(imagePath) + '\nHãy mở ảnh này bằng công cụ view_image trước khi trả lời.';
     };
+    if (command === '/start' || command === '/restart') {
+      await controlReply(command === '/restart' ? 'Đang tắt rồi mở lại Codex. Các lượt đang chạy có thể bị ngắt.' : 'Đang kiểm tra và mở Codex...');
+      try {
+        await this.appControl(command === '/restart' ? 'restart' : 'start');
+        if (command === '/restart') {
+          this.state.controlActions = {}; this.state.approvalNotices = {}; this.persist();
+        }
+        for (let attempt = 0; attempt < 20; attempt++) {
+          try { await this.call('list_threads', { limit: 1 }); return controlReply('Codex đã sẵn sàng.'); }
+          catch { await sleep(1000); }
+        }
+        return controlReply('Đã yêu cầu mở Codex nhưng App chưa trả lời. Chờ thêm hoặc dùng /restart.');
+      } catch (error) { return controlReply('Chưa mở lại được Codex: ' + error.message); }
+    }
+    if (command === '/model' || command === '/effort') {
+      const id = destination(message, this.state);
+      if (!this.state.threads[id]) return controlReply('Mở topic chat cần đổi model/effort rồi gửi ' + command + '.');
+      try { return await this.modelMenu(id, command === '/effort'); }
+      catch (error) { return controlReply('Chưa đọc được model: ' + error.message); }
+    }
     if (command === '/cancel') {
       if (this.state.newChats[menuContext(message)]) {
         delete this.state.newChats[menuContext(message)];
@@ -747,8 +907,8 @@ export class Bridge {
       }
       return;
     }
-    if (command === '/start' || command === '/help') {
-      return controlReply('/projects — chọn project, mở chat gần đây hoặc New chat\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: bot báo ngay; duyệt trong Codex App.');
+    if (command === '/help') {
+      return controlReply('/start — bật Codex\n/restart — tắt rồi mở lại Codex (ngắt các lượt đang chạy)\n/model — đổi model cho chat đang chọn\n/effort — đổi mức suy nghĩ cho model hiện tại\n/projects — chọn project, mở chat gần đây hoặc New chat\nNew chat → đặt tên → gửi prompt đầu tiên (có thể kèm ảnh/file).\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: chọn bằng nút khi có; yêu cầu không hỗ trợ thì xử lý trong App.');
     }
     if (command === '/chats') {
       const threads = await this.chats();
@@ -763,17 +923,26 @@ export class Bridge {
       }
       return;
     }
-    const newProjectId = this.state.newChats[menuContext(message)];
-    if (newProjectId && !['/status', '/update'].includes(command)) {
+    let newChat = this.state.newChats[menuContext(message)];
+    if (newChat && !['/status', '/update'].includes(command)) {
+      if (typeof newChat === 'string') newChat = this.state.newChats[menuContext(message)] = { projectId: newChat, title: null };
+      if (!newChat.title) {
+        if (!message.text || image || document || /[\r\n]/.test(text) || Array.from(text).length > 80 || text.startsWith('/')) {
+          return controlReply('Nhập tên chat bằng văn bản một dòng, tối đa 80 ký tự. Sau đó mới gửi prompt hoặc file.');
+        }
+        newChat.title = text;
+        this.persist();
+        return controlReply('Tên chat: ' + text + '\nBây giờ gửi prompt đầu tiên, ảnh hoặc file kèm yêu cầu. /cancel để hủy.');
+      }
       try { text = await prompt(); }
-      catch (error) { return controlReply('Chưa gửi ảnh vào Codex: ' + error.message + ' Gửi lại ảnh để thử lại.'); }
+      catch (error) { return controlReply('Chưa nhận được file/ảnh: ' + error.message + ' Gửi lại để thử lại.'); }
       // Consume intent before dispatch, so an uncertain creation is never replayed.
       delete this.state.newChats[menuContext(message)];
       this.persist();
       const projects = localProjects(await this.call('list_projects', {}));
-      const project = projects.find(p => p.projectId === newProjectId);
+      const project = projects.find(p => p.projectId === newChat.projectId);
       if (!project) return controlReply('Project không còn khả dụng. Gửi /projects để chọn lại.');
-      return this.createChat(project, text, update.update_id, controlReply);
+      return this.createChat(project, newChat.title, text, update.update_id, controlReply);
     }
     const id = destination(message, this.state);
     const thread = this.state.threads[id];
@@ -791,7 +960,7 @@ export class Bridge {
       return this.send(JSON.stringify(result.thread.status), id);
     }
     try { text = await prompt(); }
-    catch (error) { return controlReply('Chưa gửi ảnh vào Codex: ' + error.message + ' Gửi lại ảnh để thử lại.'); }
+    catch (error) { return controlReply('Chưa nhận được file/ảnh: ' + error.message + ' Gửi lại để thử lại.'); }
     // Only a newly forwarded question arms one reply; history never intercepts ordinary prompts.
     const callId = this.state.awaitingQuestions[id];
     delete this.state.awaitingQuestions[id];
@@ -843,10 +1012,14 @@ export class Bridge {
         } while (prior && cursor && !turns.some(t => t.id === prior.turnId));
         const flags = status?.activeFlags || [];
         const waiting = flags.filter(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag));
+        if (waiting.length) {
+          try { await this.approvalMenu(id); }
+          catch (error) { console.error('Đọc lựa chọn cấp quyền:', error.message); }
+        }
         const attention = waiting.length ? turns[0]?.id + ':' + waiting.join(',') : '';
         if (attention && this.state.attention[id] !== attention) {
           await this.send(waiting.includes('waitingOnApproval') ?
-            '⚠️ Codex đang chờ bạn cấp quyền. Mở chat này trong Codex App để xem và duyệt yêu cầu. /cancel để dừng lượt này.' :
+            '⚠️ Codex đang chờ bạn cấp quyền. Dùng nút lựa chọn nếu đã hiện; yêu cầu không có nút cần xử lý trong App. /cancel để dừng lượt này.' :
             '⚠️ Codex đang chờ bạn trả lời câu hỏi trong App. /update để xem tin mới; /cancel để dừng.', id);
         }
         this.state.attention[id] = attention;
@@ -924,11 +1097,14 @@ async function main() {
   fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
   process.once('exit', () => { try { fs.unlinkSync(lock); } catch {} });
   const call = (tool, args) => appCall(config.callerThreadId, tool, args);
-  await call('list_threads', { limit: 1 });
   const tg = (method, body) => telegram(config.token, method, body);
   const me = await tg('getMe', {});
   config.botUsername = me.username;
-  await tg('setMyCommands', { commands: [
+  const commands = [
+    { command: 'start', description: 'Bật Codex trên máy' },
+    { command: 'restart', description: 'Tắt rồi mở lại Codex' },
+    { command: 'model', description: 'Đổi model cho chat đang chọn' },
+    { command: 'effort', description: 'Đổi mức suy nghĩ cho chat đang chọn' },
     { command: 'projects', description: 'Chọn project, mở hoặc tạo chat' },
     { command: 'chats', description: 'Chọn chat có sẵn' },
     { command: 'update', description: 'Lấy tin mới từ prompt trên desktop' },
@@ -936,7 +1112,9 @@ async function main() {
     { command: 'status', description: 'Trạng thái chat trong topic' },
     { command: 'quota', description: 'Hạn mức Codex và giờ reset' },
     { command: 'help', description: 'Hướng dẫn sử dụng' },
-  ] });
+  ];
+  await tg('setMyCommands', { commands });
+  if (config.chatId) await tg('setMyCommands', { commands, scope: { type: 'chat', chat_id: config.chatId } });
   const webhook = await tg('getWebhookInfo', {});
   if (webhook.url) throw new Error('Bot đang có webhook. Dùng bot Telegram riêng để tránh tranh update.');
   const state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) :
@@ -977,8 +1155,7 @@ async function main() {
     delete state.pending;
     bridge.persist();
   }
-  await bridge.scan();
-  await bridge.send('Đã kết nối Codex. /projects để chọn chat. Prompt Telegram nhận phản hồi tự động; /update lấy tin từ desktop. /cancel dừng lượt đang chạy.');
+  await bridge.send('Bot Telegram đã bật. /start mở Codex, /restart mở lại nếu bị treo. /projects chọn chat; /model đổi model; /update lấy tin desktop.');
   console.log('Bot đang chạy. Ctrl+C để dừng.');
   // Independent loops: a slow Codex read must not block incoming steering.
   void (async () => {

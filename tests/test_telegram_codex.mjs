@@ -3,7 +3,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, quotaText, historyPair, localFileParts, telegramFileBody } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, saveTelegramDocument, quotaText, historyPair, localFileParts, telegramFileBody } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
@@ -183,6 +183,7 @@ const scanner = new Bridge({ ownerId: owner, callerThreadId: 'bridge' }, scanSta
   return { turns, page: {}, thread: { status: { type: 'active', activeFlags: flags } } };
 }, async (method, args) => { outgoing.push(args); return { message_id: outgoing.length }; }, () => {},
 undefined, undefined, async (id, turnId) => { cancelCalls.push({ id, turnId }); return { interruptedTurnId: turnId }; });
+scanner.snapshot = async () => ({ requests: [] });
 await scanner.scan(); assert.equal(outgoing.length, 0);
 turns.unshift(desktopTurn('two', 'desktop response two'));
 await scanner.scan(); assert.equal(outgoing.length, 0);
@@ -465,7 +466,7 @@ assert.equal(historyCalls.length, 0, 'opening a topic must not import desktop hi
 await historyBridge.update('A');
 assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 7, 'walk back to the Telegram prompt even past five turns');
 const imported = historyMessages.filter(m => m.method === 'sendMessage').map(m => m.args.text);
-assert.deepEqual(imported.filter(text => /^response/.test(text)), [3,4,5,6,7].map(n => 'response ' + n));
+assert.deepEqual(imported.filter(text => /^response/.test(text)), [3,4,5,6,7].map(n => 'response ' + n + '\n[end]'));
 assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG'));
 // Explicit selection imports five completed pairs independently of /update's anchor.
 const selectMessages = [];
@@ -478,7 +479,7 @@ const selectionHistory = new Bridge({ ownerId: owner }, { threads: { A: t }, rou
 await selectionHistory.handle({ callback_query: { id: 'choose', data: 'A', from: { id: owner },
   message: { chat: { id: owner, type: 'private' } } } });
 assert.deepEqual(selectMessages.filter(m => /^\[Chat A\]\nresponse/.test(m.args.text || '')).map(m => m.args.text),
-  [3,4,5,6,7].map(n => '[Chat A]\nresponse ' + n));
+  [3,4,5,6,7].map(n => '[Chat A]\nresponse ' + n + '\n[end]'));
 assert.equal(selectMessages.filter(m => m.args.text?.includes('Bạn:\nprompt')).length, 5);
 const beforeReselect = selectMessages.length;
 await selectionHistory.importRecentHistory('A');
@@ -512,7 +513,7 @@ await roleBridge.send('connected', 'A');
 await roleBridge.update('A');
 await Promise.all(replayUpdates);
 assert(roleMessages.some(m => m.sender === 'user' && m.text === 'prompt 1' && m.topicId === 707));
-assert(roleMessages.some(m => m.sender === 'bot' && m.text === 'response 1' && m.message_thread_id === 707));
+assert(roleMessages.some(m => m.sender === 'bot' && m.text === 'response 1\n[end]' && m.message_thread_id === 707));
 assert(!roleMessages.some(m => /^Bạn:|^Codex:/.test(m.text || '')), 'real sender roles need no artificial prefixes');
 assert(!roleCalls.some(c => c.tool === 'send_message_to_thread'), 'replayed history must not become a Codex prompt');
 await roleBridge.handle({ message: { ...msg, text: 'fresh prompt', message_id: 9999,
@@ -654,9 +655,14 @@ await creator.handle(click('newchat:P'));
 assert(!createCalls.some(c => c.tool === 'create_thread'), 'selecting a project must not start a chat');
 await creator.handle(input('another topic', { message_thread_id: 999 }));
 assert(!createCalls.some(c => c.tool === 'create_thread'), 'new-chat intent is scoped to the originating topic');
+await creator.handle(input('My explicit title'));
+assert(!createCalls.some(c => c.tool === 'create_thread'), 'naming a chat must not create or start it');
+assert.equal(createState.newChats[owner + ':0'].title, 'My explicit title');
+await creator.handle(input('/quota'));
+assert.equal(createState.newChats[owner + ':0'].title, 'My explicit title', 'commands preserve the named draft');
 await creator.handle(input('Create test\nInitial prompt'));
 const creation = createCalls.find(c => c.tool === 'create_thread');
-assert.deepEqual(creation.args, { prompt: 'Create test\nInitial prompt', title: 'Create test',
+assert.deepEqual(creation.args, { prompt: 'Create test\nInitial prompt', title: 'My explicit title',
   target: { type: 'project', projectId: 'P', environment: { type: 'local' } } });
 assert.equal(createState.threads.created.projectId, 'P');
 assert.equal(createState.topics.created, 404);
@@ -669,12 +675,14 @@ await creator.handle(input('do not create'));
 assert.equal(createCalls.filter(c => c.tool === 'create_thread').length, 1);
 await creator.handle(click('newchat:P'));
 creationFails = true;
+await creator.handle(input('Uncertain title'));
 await creator.handle(input('uncertain creation'));
 assert.equal(createCalls.filter(c => c.tool === 'create_thread').length, 2, 'creation must not retry on timeout');
 assert.equal(createState.pending, undefined);
 assert.deepEqual(createState.newChats, {});
 await creator.handle(click('newchat:P'));
 projectAvailable = false;
+await creator.handle(input('Removed title'));
 await creator.handle(input('removed project'));
 assert.equal(createCalls.filter(c => c.tool === 'create_thread').length, 2, 'a removed project must not receive a new chat');
 
@@ -720,23 +728,41 @@ try {
   assert.equal(imageReplies.at(-1).message_thread_id, 101);
   await imageBridge.handle({ message: { ...imageMessage, photo: undefined, document, caption: undefined } });
   assert(imageCalls.at(-1).args.prompt.startsWith('Xem và phân tích ảnh này.'));
+  const pdf = { file_id: 'pdf-file', mime_type: 'application/pdf', file_name: '../../report.pdf' };
+  const pdfBytes = Buffer.from('%PDF-1.7 test payload');
+  const pdfPath = await saveTelegramDocument(pdf, async () => ({ file_path: 'documents/report.pdf' }), '',
+    async () => new Response(pdfBytes), imageDir);
+  assert.equal(path.dirname(pdfPath), imageDir);
+  assert(path.basename(pdfPath).endsWith('-report.pdf'));
+  assert.deepEqual(fs.readFileSync(pdfPath), pdfBytes);
+  await assert.rejects(saveTelegramDocument({ ...pdf, file_size: 21 * 1024 * 1024 },
+    async () => assert.fail('reject oversized before download')), /20 MB/);
+  imageBridge.receiveDocument = async file => { assert.equal(file.file_id, 'pdf-file'); return pdfPath; };
+  await imageBridge.handle({ message: { ...imageMessage, photo: undefined, document: pdf, caption: 'Tóm tắt PDF' } });
+  assert(imageCalls.at(-1).args.prompt.startsWith('Tóm tắt PDF'));
+  assert(imageCalls.at(-1).args.prompt.includes(JSON.stringify(pdfPath)));
+  assert(!imageCalls.at(-1).args.prompt.includes('view_image'));
   const priorImageCalls = imageCalls.length;
-  await imageBridge.handle({ message: { ...imageMessage, photo: undefined, document: { mime_type: 'application/pdf' } } });
-  assert.equal(imageCalls.length, priorImageCalls, 'unsupported attachment must not silently become a caption-only prompt');
+  imageBridge.receiveDocument = async () => { throw new Error('download failed'); };
+  await imageBridge.handle({ message: { ...imageMessage, photo: undefined, document: pdf, caption: 'file failed' } });
+  assert.equal(imageCalls.length, priorImageCalls, 'document download failure must not send only its caption');
   downloadFails = true;
   await imageBridge.handle({ message: imageMessage });
   assert.equal(imageCalls.length, priorImageCalls, 'failed download must not dispatch a text-only prompt');
-  assert(imageReplies.at(-1).text.includes('Chưa gửi ảnh'));
+  assert(imageReplies.at(-1).text.includes('Chưa nhận được'));
   assert.equal(imageBridge.state.pending, undefined);
   await imageBridge.handle({ message: { ...imageMessage, photo: undefined, caption: undefined, text: '/help@OUR_BOT' } });
-  assert(imageReplies.at(-1).text.startsWith('/projects'));
+  assert(imageReplies.at(-1).text.includes('/projects'));
 
   projectAvailable = true;
   creationFails = false;
   creator.receiveImage = async () => { throw new Error('download failed'); };
   await creator.handle(click('newchat:P'));
+  await creator.handle(input(undefined, { document: pdf, caption: 'Not a title' }));
+  assert.equal(createState.newChats[owner + ':0'].title, null, 'attachment must not become a chat name');
+  await creator.handle(input('Chat ảnh'));
   await creator.handle(input(undefined, { photo: [photo], caption: 'Chat ảnh' }));
-  assert.equal(createState.newChats[owner + ':0'], 'P', 'failed image download must preserve New chat intent');
+  assert.deepEqual(createState.newChats[owner + ':0'], { projectId: 'P', title: 'Chat ảnh' }, 'failed image download must preserve named draft');
   assert.equal(createCalls.filter(c => c.tool === 'create_thread').length, 2);
   creator.receiveImage = async () => imagePath;
   await creator.handle(input(undefined, { photo: [photo], caption: 'Chat ảnh' }));
@@ -744,6 +770,14 @@ try {
   assert.equal(imageCreation.args.title, 'Chat ảnh');
   assert(imageCreation.args.prompt.includes(JSON.stringify(imagePath)));
   assert.equal(imageCreation.args.target.projectId, 'P');
+  await creator.handle(click('newchat:P'));
+  await creator.handle(input('Chat tài liệu'));
+  creator.receiveDocument = async () => pdfPath;
+  await creator.handle(input(undefined, { document: pdf, caption: 'Phân tích file đầu tiên' }));
+  const docCreation = createCalls.filter(c => c.tool === 'create_thread').at(-1);
+  assert.equal(docCreation.args.title, 'Chat tài liệu');
+  assert(docCreation.args.prompt.startsWith('Phân tích file đầu tiên'));
+  assert(docCreation.args.prompt.includes(JSON.stringify(pdfPath)));
 }
 finally { fs.rmSync(imageDir, { recursive: true }); }
 console.log('telegram_codex: checks passed (commands, images, authorization, routing, projects, no retry, pipe, streaming, deduplication).');
