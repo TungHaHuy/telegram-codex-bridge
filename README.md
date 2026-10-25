@@ -16,6 +16,8 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 - `/projects` và `/chats` hiển thị danh sách trong một menu, không chia mỗi 10 mục thành tin riêng.
 - Bấm New chat → nhập tên chat → gửi prompt đầu tiên để tạo chat trong đúng project.
   Tin nhập tên chưa chạy model; prompt đầu tiên có thể kèm ảnh hoặc file.
+- Prompt đầu tiên được chép từ nơi tạo sang topic mới trước phản hồi Codex;
+  tin chép dùng cơ chế replay lịch sử nên không chạy lại yêu cầu.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
 - Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; chọn chat
   từ menu nhập tối đa 20 lượt hỏi–đáp đã hoàn tất gần nhất một lần, chat mới trên desktop không tự xuất hiện.

@@ -8,6 +8,9 @@ không tự đặt số phiên bản. Phần kiểm thử phân biệt kết qu�
 - `/projects` và `/chats` gửi một menu đầy đủ thay vì tự chia mỗi 10 nút thành
   nhiều tin. Giữ nguyên thứ tự, tuyến topic và dữ liệu callback.
 - Test với 12 project và 23 chat xác nhận không tách hai mục cuối thành tin riêng.
+- New chat chép prompt đầu tiên từ nơi tạo sang topic mới trước khi gửi phản
+  hồi Codex. Tái sử dụng cơ chế gửi lịch sử và bỏ qua tin replay, không chạy
+  lại prompt hay tạo thêm lượt. Tin tiếp theo trong đúng topic không bị chép lặp.
 
 ## 25/10/2026 — Nâng giới hạn menu và lịch sử lên 20
 

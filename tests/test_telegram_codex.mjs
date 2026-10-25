@@ -738,8 +738,36 @@ assert.deepEqual(creation.args, { prompt: 'Create test\nInitial prompt', title: 
 assert.equal(createState.threads.created.projectId, 'P');
 assert.equal(createState.topics.created, 404);
 assert(createMessages.some(m => m.args.text?.startsWith('Đã tạo chat mới trong project My project') && m.args.message_thread_id === 404));
+assert(createMessages.some(m => m.args.text === 'Bạn:\nCreate test\nInitial prompt' && m.args.message_thread_id === 404),
+  'copy the initial prompt from the creation context into the new topic');
 await creator.scan();
 assert(createMessages.some(m => m.args.text?.includes('FIRST_REPLY_OK') && m.args.message_thread_id === 404));
+assert.equal(createMessages.filter(m => m.args.text === 'Bạn:\nCreate test\nInitial prompt').length, 1);
+assert(createMessages.findIndex(m => m.args.text === 'Bạn:\nCreate test\nInitial prompt') <
+  createMessages.findIndex(m => m.args.text?.includes('FIRST_REPLY_OK')), 'show first prompt before replies');
+
+// Personal replay stays in the new topic and cannot submit a second model prompt.
+const firstReplayState = { topicMode: true, threads: {}, routes: {}, seen: {} };
+const firstReplayCalls = [], firstReplayMessages = [];
+let firstReplayBridge;
+firstReplayBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, firstReplayState, async (tool, args) => {
+  firstReplayCalls.push({ tool, args });
+  assert.equal(tool, 'create_thread'); return { threadId: 'first-replay', hostId: 'local' };
+}, async (method, args) => {
+  firstReplayMessages.push({ method, args });
+  return method === 'createForumTopic' ? { message_thread_id: 909 } : { message_id: firstReplayMessages.length };
+}, () => {}, undefined, async (text, topicId) => {
+  assert.equal(topicId, 909); assert.equal(text, 'First prompt');
+  assert.equal(firstReplayState.historyPending['-1001234:909'], text);
+  await firstReplayBridge.scan(); // Model responses must wait until initial replay completes.
+  await firstReplayBridge.handle({ message: { ...msg, text, message_id: 123, message_thread_id: topicId,
+    chat: { id: -1001234, type: 'supergroup' } } });
+  return { id: 123 };
+});
+await firstReplayBridge.createChat(project, 'Replay test', 'First prompt', 200, async () => assert.fail('creation failed'));
+assert.equal(firstReplayState.ignoredPrompts['-1001234:123'], true);
+assert.equal(firstReplayState.historyPending['-1001234:909'], undefined);
+assert.deepEqual(firstReplayCalls.map(c => c.tool), ['create_thread'], 'no model replay during initial prompt copy');
 await creator.handle(click('newchat:P'));
 await creator.handle(input('/cancel@our_bot'));
 await creator.handle(input('do not create'));

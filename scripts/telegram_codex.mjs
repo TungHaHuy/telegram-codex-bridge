@@ -788,6 +788,10 @@ export class Bridge {
       this.persist();
       await this.send('Đã tạo chat mới trong project ' + project.label +
         '. Tiếp tục nhắn tại topic này.', id);
+      if (this.state.topicMode) {
+        // The first prompt was sent in the creation topic, not this new topic.
+        await this.deliver(id, { key: 'initial-prompt:' + id, role: 'user', text: prompt, origin: 'desktop' });
+      }
     } catch (error) {
       await reply((id ? 'Chat đã được tạo, nhưng chưa hoàn tất thông báo Telegram: ' :
         'Tạo chat chưa được xác nhận: ') + error.message + '\nBot không tự tạo lại để tránh trùng chat.');
@@ -1007,6 +1011,8 @@ export class Bridge {
     for (const id of Object.keys(this.state.enabled).filter(id => this.state.enabled[id])) {
       const thread = this.state.threads[id];
       if (!thread) continue;
+      // Keep the copied first prompt ahead of responses, including fast turns.
+      if (this.state.pending?.kind === 'create' && this.state.pending.threadId === id) continue;
       try {
         const prior = this.state.seen[id];
         const turns = [];
