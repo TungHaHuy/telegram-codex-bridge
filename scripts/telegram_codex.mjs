@@ -913,31 +913,26 @@ export class Bridge {
       this.state.projects = Object.fromEntries(projects.map(p => [p.projectId, p]));
       this.persist();
       if (!projects.length) return controlReply('Chưa có project local trên máy này.');
-      for (let i = 0; i < projects.length; i += 10) {
-        await this.send('Chọn project:', null, {
-          chat_id: message.chat.id,
-          ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }),
-          reply_markup: { inline_keyboard: projects.slice(i, i + 10)
-            .map(p => [{ text: p.label, callback_data: 'project:' + p.projectId }]) },
-        });
-      }
-      return;
+      return this.send('Chọn project:', null, {
+        chat_id: message.chat.id,
+        ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }),
+        reply_markup: { inline_keyboard: projects
+          .map(p => [{ text: p.label, callback_data: 'project:' + p.projectId }]) },
+      });
     }
     if (command === '/help') {
       return controlReply('/start — bật Codex\n/restart — tắt rồi mở lại Codex (ngắt các lượt đang chạy)\n/model — đổi model cho chat đang chọn\n/effort — đổi mức suy nghĩ cho model hiện tại\n/projects — chọn project, mở chat gần đây hoặc New chat\nNew chat → đặt tên → gửi prompt đầu tiên (có thể kèm ảnh/file).\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: chọn bằng nút khi có; yêu cầu không hỗ trợ thì xử lý trong App.');
     }
     if (command === '/chats') {
       const threads = await this.chats();
-      // Telegram keyboards are limited; split the recent list into small pages.
-      for (let i = 0; i < threads.length; i += 10) {
-        await this.send(this.state.topicMode ? 'Chọn chat để mở topic riêng:' : 'Chọn chat:', null, {
-          chat_id: message.chat.id,
-          ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }),
-          reply_markup: { inline_keyboard:
-          threads.slice(i, i + 10).map(t => [{ text: t.title, callback_data: t.id }]),
-        } });
-      }
-      return;
+      if (!threads.length) return;
+      return this.send(this.state.topicMode ? 'Chọn chat để mở topic riêng:' : 'Chọn chat:', null, {
+        chat_id: message.chat.id,
+        ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }),
+        reply_markup: { inline_keyboard:
+          threads.map(t => [{ text: t.title, callback_data: t.id }]),
+        },
+      });
     }
     let newChat = this.state.newChats[menuContext(message)];
     if (newChat && !['/status', '/update'].includes(command)) {

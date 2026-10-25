@@ -638,6 +638,22 @@ creator = new Bridge({ ownerId: owner, callerThreadId: 'bridge', botUsername: 'o
 }, () => {});
 const input = (text, extras = {}) => ({ update_id: 200, message: { ...msg, text, ...extras } });
 const click = data => ({ callback_query: { id: 'callback', from: msg.from, data, message: { chat: msg.chat } } });
+// Lists longer than ten remain one complete keyboard in the originating topic.
+const menuProjects = Array.from({ length: 12 }, (_, i) => ({ ...project, projectId: 'menu' + i, label: 'Menu ' + i }));
+const menuMessages = [];
+const menuBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, { threads: {}, routes: {}, seen: {} }, async tool => {
+  if (tool === 'list_projects') return { projects: menuProjects };
+  assert.equal(tool, 'list_threads'); return { threads: recent, pinnedThreads: [] };
+}, async (method, args) => { menuMessages.push(args); return { message_id: menuMessages.length }; }, () => {});
+const menuInput = text => ({ message: { ...msg, text, chat: { id: -1001234, type: 'supergroup' }, message_thread_id: 101 } });
+await menuBridge.handle(menuInput('/projects'));
+assert.equal(menuMessages.length, 1, 'do not split twelve projects into ten plus two');
+assert.deepEqual(menuMessages[0].reply_markup.inline_keyboard.flat().map(b => b.callback_data),
+  menuProjects.map(p => 'project:' + p.projectId));
+await menuBridge.handle(menuInput('/chats'));
+assert.equal(menuMessages.length, 2, 'all recent chats should be one menu');
+assert.deepEqual(menuMessages[1].reply_markup.inline_keyboard.flat().map(b => b.callback_data), recent.map(t => t.id));
+assert(menuMessages.every(m => m.chat_id === -1001234 && m.message_thread_id === 101));
 await creator.handle(input('/projects'));
 assert.equal(createMessages.at(-1).args.reply_markup.inline_keyboard[0][0].callback_data, 'project:P');
 for (const command of ['/projects@our_bot', '/projects@OUR_BOT', '/projects@our_bot ']) {

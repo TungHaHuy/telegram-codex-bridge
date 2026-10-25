@@ -3,6 +3,12 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 26/10/2026 — Gộp danh sách chọn project/chat
+
+- `/projects` và `/chats` gửi một menu đầy đủ thay vì tự chia mỗi 10 nút thành
+  nhiều tin. Giữ nguyên thứ tự, tuyến topic và dữ liệu callback.
+- Test với 12 project và 23 chat xác nhận không tách hai mục cuối thành tin riêng.
+
 ## 25/10/2026 — Nâng giới hạn menu và lịch sử lên 20
 
 - Menu project hiển thị New chat và tối đa 20 chat gần nhất, thay cho 5.

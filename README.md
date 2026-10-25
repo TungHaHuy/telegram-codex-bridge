@@ -13,6 +13,7 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 ## Chức năng
 
 - `/projects` → chọn project → **＋ New chat** và tối đa 20 chat gần nhất trong project.
+- `/projects` và `/chats` hiển thị danh sách trong một menu, không chia mỗi 10 mục thành tin riêng.
 - Bấm New chat → nhập tên chat → gửi prompt đầu tiên để tạo chat trong đúng project.
   Tin nhập tên chưa chạy model; prompt đầu tiên có thể kèm ảnh hoặc file.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
