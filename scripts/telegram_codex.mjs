@@ -544,8 +544,8 @@ export class Bridge {
         if (pair) pairs.push(pair);
       }
       cursor = result.page?.nextCursor;
-    } while (cursor && pairs.length < 5);
-    for (const { turn } of pairs.slice(0, 5).reverse()) {
+    } while (cursor && pairs.length < 20);
+    for (const { turn } of pairs.slice(0, 20).reverse()) {
       const finalIds = new Set(turn.items.filter(i => i.type === 'agentMessage' &&
         (!i.phase || i.phase === 'final_answer')).map(i => i.id));
       for (const event of conversationEvents([turn])) {
@@ -613,6 +613,18 @@ export class Bridge {
     }
   }
 
+  async startApp(action = 'start', pause = sleep) {
+    await this.appControl(action);
+    if (action === 'restart') {
+      this.state.controlActions = {}; this.state.approvalNotices = {}; this.persist();
+    }
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { await this.call('list_threads', { limit: 1 }); return true; }
+      catch { await pause(1000); }
+    }
+    return false;
+  }
+
   async chats() {
     const threads = localThreads(await this.call('list_threads', { limit: 50 }), this.readProjectState());
     for (const thread of threads) this.state.threads[thread.id] = thread;
@@ -626,7 +638,7 @@ export class Bridge {
     delete this.state.newChats[menuContext(message)];
     await this.chats();
     const recent = Object.values(this.state.threads).filter(t => t.projectId === projectId)
-      .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 5);
+      .sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 20);
     await this.send('Project: ' + project.label + '\nTạo chat mới hoặc mở chat gần đây:', null, {
       chat_id: message.chat.id,
       ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }),
@@ -850,14 +862,7 @@ export class Bridge {
     if (command === '/start' || command === '/restart') {
       await controlReply(command === '/restart' ? 'Đang tắt rồi mở lại Codex. Các lượt đang chạy có thể bị ngắt.' : 'Đang kiểm tra và mở Codex...');
       try {
-        await this.appControl(command === '/restart' ? 'restart' : 'start');
-        if (command === '/restart') {
-          this.state.controlActions = {}; this.state.approvalNotices = {}; this.persist();
-        }
-        for (let attempt = 0; attempt < 20; attempt++) {
-          try { await this.call('list_threads', { limit: 1 }); return controlReply('Codex đã sẵn sàng.'); }
-          catch { await sleep(1000); }
-        }
+        if (await this.startApp(command === '/restart' ? 'restart' : 'start')) return controlReply('Codex đã sẵn sàng.');
         return controlReply('Đã yêu cầu mở Codex nhưng App chưa trả lời. Chờ thêm hoặc dùng /restart.');
       } catch (error) { return controlReply('Chưa mở lại được Codex: ' + error.message); }
     }
@@ -1155,13 +1160,20 @@ async function main() {
     delete state.pending;
     bridge.persist();
   }
-  await bridge.send('Bot Telegram đã bật. /start mở Codex, /restart mở lại nếu bị treo. /projects chọn chat; /model đổi model; /update lấy tin desktop.');
+  await bridge.send('Bot Telegram đã bật, đang kiểm tra và mở Codex. /start mở Codex, /restart mở lại nếu bị treo. /projects chọn chat; /model đổi model; /update lấy tin desktop.');
   console.log('Bot đang chạy. Ctrl+C để dừng.');
   // Independent loops: a slow Codex read must not block incoming steering.
   void (async () => {
-    let lastError = '';
+    let lastError = '', ready = false;
     for (;;) {
-      try { await bridge.scan(); lastError = ''; }
+      try {
+        if (!ready) {
+          ready = await bridge.startApp();
+          if (!ready) throw new Error('Đã yêu cầu mở Codex nhưng App chưa trả lời. Bot sẽ thử lại.');
+          console.log('Codex đã sẵn sàng, bắt đầu đọc các chat đã chọn.');
+        }
+        await bridge.scan(); lastError = '';
+      }
       catch (error) {
         console.error('Đọc Codex:', error.message);
         if (error.message !== lastError) {

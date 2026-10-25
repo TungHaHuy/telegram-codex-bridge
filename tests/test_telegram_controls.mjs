@@ -18,6 +18,30 @@ assert.deepEqual(lifecycle, ['start', 'restart']);
 assert(calls.every(c => c.tool === 'list_threads'), 'lifecycle commands never send model prompts');
 await assert.rejects(async () => controlCodexApp('shutdown'), /Invalid app action/);
 
+// Startup uses the same sequence as /start, without probing before the launch completes.
+const startupEvents = [];
+let readyAttempts = 0;
+const startup = new Bridge({ ownerId: 1 }, {}, async (tool, args) => {
+  startupEvents.push('probe');
+  assert.equal(tool, 'list_threads'); assert.equal(args.limit, 1);
+  if (++readyAttempts < 3) throw new Error('App is loading');
+  return {};
+}, async () => ({}), () => {});
+startup.appControl = async action => {
+  startupEvents.push(action);
+  await new Promise(resolve => setImmediate(resolve));
+  startupEvents.push('launched');
+};
+assert.equal(await startup.startApp('start', async () => { startupEvents.push('wait'); }), true);
+assert.deepEqual(startupEvents, ['start', 'launched', 'probe', 'wait', 'probe', 'wait', 'probe']);
+startup.appControl = async () => { throw new Error('Launch failed'); };
+const beforeFailedLaunch = readyAttempts;
+await assert.rejects(startup.startApp(), /Launch failed/);
+assert.equal(readyAttempts, beforeFailedLaunch, 'failed launch must not probe Codex');
+startup.appControl = async () => {};
+startup.call = async () => { throw new Error('App unavailable'); };
+assert.equal(await startup.startApp('start', async () => {}), false, 'timeout must not report readiness');
+
 let currentModel = 'old';
 let currentEffort = 'high';
 bridge.models = () => [{ model: 'new', label: 'New model', defaultEffort: 'low', efforts: ['low', 'medium'] }];

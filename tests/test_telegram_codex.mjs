@@ -468,19 +468,22 @@ assert.equal(historyCalls.filter(c => c.tool === 'read_thread').length, 7, 'walk
 const imported = historyMessages.filter(m => m.method === 'sendMessage').map(m => m.args.text);
 assert.deepEqual(imported.filter(text => /^response/.test(text)), [3,4,5,6,7].map(n => 'response ' + n + '\n[end]'));
 assert(!imported.join('\n').includes('PRIVATE_TOOL_LOG'));
-// Explicit selection imports five completed pairs independently of /update's anchor.
+// Explicit selection imports at most twenty completed pairs, skipping incomplete turns.
+const selectionTurns = [{ ...historyTurn(24), status: 'inProgress' },
+  { status: 'completed', items: [historyTurn(23).items.at(-1)] },
+  ...Array.from({ length: 22 }, (_, i) => historyTurn(22 - i))];
 const selectMessages = [];
 const selectionHistory = new Bridge({ ownerId: owner }, { threads: { A: t }, routes: {}, seen: {} },
   async (tool, args) => {
     assert.equal(tool, 'read_thread');
     const index = Number(args.cursor || 0);
-    return { turns: [historyTurns[index]], page: { nextCursor: String(index + 1) } };
+    return { turns: [selectionTurns[index]], page: index + 1 < selectionTurns.length ? { nextCursor: String(index + 1) } : {} };
   }, async (method, args) => { selectMessages.push({ method, args }); return { message_id: selectMessages.length }; }, () => {});
 await selectionHistory.handle({ callback_query: { id: 'choose', data: 'A', from: { id: owner },
   message: { chat: { id: owner, type: 'private' } } } });
 assert.deepEqual(selectMessages.filter(m => /^\[Chat A\]\nresponse/.test(m.args.text || '')).map(m => m.args.text),
-  [3,4,5,6,7].map(n => '[Chat A]\nresponse ' + n + '\n[end]'));
-assert.equal(selectMessages.filter(m => m.args.text?.includes('Bạn:\nprompt')).length, 5);
+  Array.from({ length: 20 }, (_, i) => '[Chat A]\nresponse ' + (i + 3) + '\n[end]'));
+assert.equal(selectMessages.filter(m => m.args.text?.includes('Bạn:\nprompt')).length, 20);
 const beforeReselect = selectMessages.length;
 await selectionHistory.importRecentHistory('A');
 assert.equal(selectMessages.length, beforeReselect, 'reselecting must not repeat imported history');
@@ -561,7 +564,7 @@ assert(quotaReplies.at(-1).text.includes('Chưa đọc được hạn mức Code
 // Projects -> project menu -> explicit New chat -> first prompt.
 const project = { projectId: 'P', projectKind: 'local', hostId: 'local', label: 'My project' };
 assert.deepEqual(localProjects({ projects: [project, { ...project, hostId: 'remote' }, { ...project, projectKind: 'chatgpt' }] }), [project]);
-const recent = Array.from({ length: 7 }, (_, i) => ({ ...t, id: 'r' + i, title: 'Recent ' + i, projectId: 'P', updatedAt: i }));
+const recent = Array.from({ length: 23 }, (_, i) => ({ ...t, id: 'r' + i, title: 'Recent ' + i, projectId: 'P', updatedAt: i }));
 const createState = { topicMode: true, routes: {}, threads: {}, seen: {} };
 const createCalls = [], createMessages = [];
 let creationFails = false, projectAvailable = true;
@@ -596,7 +599,8 @@ assert.equal(createMessages.length, beforeWrongBot, 'commands addressed to anoth
 await creator.handle(click('project:P'));
 const projectButtons = createMessages.at(-1).args.reply_markup.inline_keyboard;
 assert.equal(projectButtons[0][0].callback_data, 'newchat:P');
-assert.deepEqual(projectButtons.slice(1).map(row => row[0].callback_data), ['r6','r5','r4','r3','r2']);
+assert.deepEqual(projectButtons.slice(1).map(row => row[0].callback_data),
+  Array.from({ length: 20 }, (_, i) => 'r' + (22 - i)));
 
 // New/live chats may have null API project IDs despite explicit saved membership.
 const savedProjects = {
@@ -608,7 +612,7 @@ const savedProjects = {
 };
 const missingProject = (id, updatedAt = 10) => ({ ...t, id, title: id, projectId: null, cwd: 'same-folder', updatedAt });
 const projectInventory = { pinnedThreads: [], threads: [
-  missingProject('new-a', 12), missingProject('new-b', 11), missingProject('projectless', 99),
+  missingProject('new-a', 102), missingProject('new-b', 101), missingProject('projectless', 999),
   { ...missingProject('different'), projectId: 'Q' }, missingProject('remote-host'), missingProject('deleted'),
   missingProject('no-assignment'), { ...missingProject('cloud'), hostId: 'remote' },
   ...recent,
@@ -630,7 +634,7 @@ const fixedMenu = new Bridge({ ownerId: owner }, fixedMenuState, async tool => {
 () => {}, undefined, undefined, undefined, () => savedProjects);
 await fixedMenu.handle(click('project:P'));
 assert.deepEqual(fixedMenuMessages.at(-1).reply_markup.inline_keyboard.slice(1).map(row => row[0].callback_data),
-  ['new-a', 'new-b', 'r6', 'r5', 'r4']);
+  ['new-a', 'new-b', ...Array.from({ length: 18 }, (_, i) => 'r' + (22 - i))]);
 assert.equal(fixedMenuState.threads['new-a'].projectId, 'P');
 assert.deepEqual(fixedMenuState.enabled, {}, 'listing chats must not opt them into forwarding');
 savedProjects['thread-project-assignments']['new-a'].projectId = 'Q';

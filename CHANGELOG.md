@@ -3,6 +3,16 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 25/10/2026 — Nâng giới hạn menu và lịch sử lên 20
+
+- Menu project hiển thị New chat và tối đa 20 chat gần nhất, thay cho 5.
+- Lần đầu chọn chat có sẵn lấy tối đa 20 cặp prompt–response đã hoàn tất,
+  giữ thứ tự cũ đến mới và không nhập lặp lịch sử đã lấy.
+- Kiểm thử bao phủ dữ liệu vượt giới hạn, thứ tự, lọc project và bỏ lượt chưa hoàn tất.
+- Khi bot khởi động, dùng cùng quy trình với `/start` để mở Codex và chờ App
+  sẵn sàng rồi mới quét các chat đã chọn. Nếu mở/chờ thất bại, báo lỗi và thử
+  lại; bot vẫn nhận lệnh Telegram trong lúc chờ.
+
 ## 24/10/2026 — Đặt tên chat, nhận tài liệu và điều khiển Codex
 
 ### Thay đổi

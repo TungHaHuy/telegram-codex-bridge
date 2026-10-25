@@ -12,12 +12,12 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 
 ## Chức năng
 
-- `/projects` → chọn project → **＋ New chat** và 5 chat gần nhất trong project.
+- `/projects` → chọn project → **＋ New chat** và tối đa 20 chat gần nhất trong project.
 - Bấm New chat → nhập tên chat → gửi prompt đầu tiên để tạo chat trong đúng project.
   Tin nhập tên chưa chạy model; prompt đầu tiên có thể kèm ảnh hoặc file.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
 - Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; chọn chat
-  từ menu nhập 5 lượt hỏi–đáp gần nhất một lần, chat mới trên desktop không tự xuất hiện.
+  từ menu nhập tối đa 20 lượt hỏi–đáp đã hoàn tất gần nhất một lần, chat mới trên desktop không tự xuất hiện.
 - Nhắn trong topic để gửi prompt hoặc steer; phản hồi/lỗi từ prompt Telegram tự về.
 - Đường dẫn file local trong phản hồi được thay bằng file đính kèm, xen giữa
   các đoạn chữ theo đúng thứ tự. Hỗ trợ link Markdown, đường dẫn trong backtick
@@ -178,7 +178,7 @@ bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượ
 
 | Lệnh | Tác dụng |
 | --- | --- |
-| `/projects` | Menu project → New chat và 5 chat gần nhất |
+| `/projects` | Menu project → New chat và tối đa 20 chat gần nhất |
 | `/start` | Bật Codex nếu chưa chạy, kiểm tra App sẵn sàng |
 | `/restart` | Dừng cây tiến trình Codex và mở lại; có thể ngắt công việc đang chạy |
 | `/model` | Menu model cho chat trong topic hiện tại, áp dụng lượt tiếp theo |
@@ -220,7 +220,9 @@ gian chạy và chỉ chạy một phiên task. Nếu Codex hoặc mạng chưa 
 bot thoát lỗi, launcher chờ 15 giây rồi thử lại, không giới hạn số lần.
 Task Scheduler vẫn thử lại mỗi phút, tối đa 255 lần nếu chính launcher gặp lỗi.
 Log ở `.telegram-codex/stdout.log`
-và `stderr.log`. Codex App cũng cần tự bật cùng Windows hoặc được bạn mở sau đó.
+và `stderr.log`. Khi bot khởi động, bot dùng cùng quy trình với `/start` để mở
+Codex, chờ App sẵn sàng rồi mới đọc các chat đã chọn. Nếu chưa mở/kết nối được,
+bot báo lỗi và thử lại; vẫn nhận lệnh Telegram trong lúc chờ.
 
 Kiểm tra cấu hình startup và tiến trình đang chạy:
 
