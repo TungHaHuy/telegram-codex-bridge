@@ -7,13 +7,64 @@ import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRe
 
 const owner = 1234;
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
-assert(authorized(msg, owner));
-assert(!authorized({ ...msg, from: { id: 99 } }, owner));
-assert(!authorized({ ...msg, chat: { id: owner, type: 'group' } }, owner));
-assert(!authorized(msg, null));
-assert(authorized({ ...msg, chat: { id: -1001234, type: 'supergroup' } }, owner, -1001234));
-assert(!authorized({ ...msg, chat: { id: -1009999, type: 'supergroup' } }, owner, -1001234));
-assert(!authorized({ ...msg, from: { id: 99 }, chat: { id: -1001234, type: 'supergroup' } }, owner, -1001234));
+assert(await authorized(msg, owner));
+assert(!await authorized({ ...msg, from: { id: 99 } }, owner));
+assert(!await authorized({ ...msg, chat: { id: owner, type: 'group' } }, owner));
+assert(!await authorized(msg, null));
+assert(await authorized({ ...msg, chat: { id: -1001234, type: 'supergroup' } }, owner, -1001234));
+assert(!await authorized({ ...msg, chat: { id: -1009999, type: 'supergroup' } }, owner, -1001234));
+const otherAdmin = { ...msg, from: { id: 99 }, chat: { id: -1001234, type: 'supergroup' } };
+assert(!await authorized(otherAdmin, owner, -1001234));
+for (const status of ['creator', 'administrator', 'member', 'restricted', 'left', 'kicked']) {
+  assert.equal(await authorized(otherAdmin, owner, -1001234, async args => {
+    assert.deepEqual(args, { chat_id: -1001234, user_id: 99 });
+    return { user: { id: 99, is_bot: false }, status };
+  }), ['creator', 'administrator'].includes(status));
+}
+for (const rejected of [msg, { ...otherAdmin, chat: { id: -999, type: 'supergroup' } },
+  { ...otherAdmin, from: { id: 99, is_bot: true } }, { ...otherAdmin, sender_chat: otherAdmin.chat }]) {
+  assert(!await authorized({ ...rejected, from: { ...rejected.from, id: 99 } }, owner, -1001234,
+    async () => assert.fail('wrong chat, bot or anonymous sender must not query membership')));
+}
+assert(!await authorized(otherAdmin, owner, -1001234,
+  async () => ({ user: { id: 100 }, status: 'administrator' })), 'membership must match the actual sender');
+const authError = console.error;
+try {
+  console.error = () => {};
+  assert(!await authorized(otherAdmin, owner, -1001234, async () => { throw new Error('Telegram unavailable'); }));
+} finally { console.error = authError; }
+
+// A second account uses its current group role for prompts, commands and callbacks.
+let adminStatus = 'administrator';
+const adminCalls = [], adminMessages = [];
+const adminState = { topicMode: true, topics: { A: 101 }, threads: { A: { title: 'A' } }, routes: {}, seen: {} };
+const adminBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, adminState, async (tool, args) => {
+  adminCalls.push({ tool, args });
+  if (tool === 'list_projects') return { projects: [{ projectId: 'P', projectKind: 'local', hostId: 'local', label: 'P' }] };
+  return {};
+}, async (method, args) => {
+  if (method === 'getChatMember') return { user: { id: 99, is_bot: false }, status: adminStatus };
+  adminMessages.push({ method, args }); return { message_id: adminMessages.length };
+}, () => {}, async () => assert.fail('unauthorized file must not download'));
+const adminMessage = { ...otherAdmin, message_thread_id: 101, text: 'Second account prompt' };
+await adminBridge.handle({ message: adminMessage });
+assert.deepEqual(adminCalls, [{ tool: 'send_message_to_thread', args: {
+  threadId: 'A', hostId: 'local', prompt: 'Second account prompt',
+} }]);
+await adminBridge.handle({ message: { ...adminMessage, text: '/quota' } });
+assert.equal(adminCalls.at(-1).tool, 'get_usage_limits');
+const adminCallback = { callback_query: { id: 'admin-click', from: { id: 99 }, data: 'newchat:P',
+  message: { ...adminMessage, from: { id: 777, is_bot: true } } } };
+await adminBridge.handle(adminCallback);
+assert.equal(adminState.newChats['-1001234:101'].projectId, 'P', 'authorize callback sender, not bot message author');
+delete adminState.newChats['-1001234:101'];
+const beforeAdminReject = adminCalls.length;
+adminStatus = 'member';
+await adminBridge.handle({ message: adminMessage });
+await adminBridge.handle(adminCallback);
+await adminBridge.handle({ message: { ...adminMessage, photo: [{ file_id: 'unauthorized' }] } });
+assert.equal(adminCalls.length, beforeAdminReject, 'demotion takes effect immediately for all input paths');
+assert.equal(adminState.newChats['-1001234:101'], undefined);
 assert.equal(destination({ reply_to_message: { message_id: 7 } }, { routes: { 7: 'A' }, selected: 'B' }), 'A');
 assert.equal(destination({ reply_to_message: { message_id: 9 } }, { routes: {}, selected: 'B' }), null);
 const long = '😀 xin chào '.repeat(1000);

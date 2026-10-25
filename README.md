@@ -41,7 +41,8 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 - `/effort` chọn mức suy nghĩ model hiện tại hỗ trợ, giữ nguyên model và áp dụng
   từ lượt tiếp theo. Menu cũ không dùng được nếu model đã đổi.
 - Yêu cầu cấp quyền được hỗ trợ có nút cho phép/từ chối ngay trong topic. Chỉ
-  chủ bot được chọn, quyết định gắn với đúng nội dung yêu cầu đang chờ. Login,
+  chủ bot hoặc chủ nhóm/admin trong group đã liên kết được chọn; quyết định
+  gắn với đúng nội dung yêu cầu đang chờ. Login,
   OTP, xác minh danh tính và form khác vẫn làm trong App.
 - Phản hồi chốt có `[end]` ở cuối; tin tiến độ và câu hỏi không có marker này.
 
@@ -123,9 +124,17 @@ Sau khi ghép tài khoản ở private chat:
    ứng; tiếp tục nhắn bên trong topic đó. **General** dùng cho menu, không nhận
    prompt cho một chat ngẫu nhiên.
 
-Chỉ tài khoản đã ghép trong private chat và đúng nhóm cấu hình được điều khiển
-Codex. Thành viên khác hoặc nhóm khác bị từ chối. Không thêm người lạ vào nhóm:
-nhóm nhận nội dung phản hồi của các chat Codex local đang được theo dõi.
+Tài khoản đã ghép vẫn điều khiển được trong private chat và đúng nhóm cấu hình.
+Các tài khoản khác điều khiển được trong nhóm đó khi là chủ nhóm hoặc admin;
+bot kiểm tra quyền hiện tại qua [getChatMember](https://core.telegram.org/bots/api#getchatmember)
+mỗi tin/lần bấm nút, không cần ghép lại hay sửa ownerId. Bot phải là admin nhóm.
+Thành viên thường, bot và nhóm khác bị từ chối; private chat không mở cho các
+admin khác. Khi dùng tài khoản thứ hai, tắt **Remain Anonymous** và gửi với danh
+tính tài khoản cá nhân. Chỉ cấp admin cho tài khoản được quyền điều khiển máy.
+Nhóm nhận phản hồi của các chat Codex local đang được theo dõi.
+
+Nếu dùng hai máy, cập nhật code và khởi động lại bot trên từng máy cần hỗ trợ
+quyền này. Mỗi máy giữ nguyên token, phiên Telegram và cấu hình group riêng.
 
 Nếu không dùng Topics, `/chats` chọn chat cho tin tiếp theo; Reply một tin của
 bot cũng gửi vào đúng chat của tin đó. Trong topic, chính topic quyết định tuyến,

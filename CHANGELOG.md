@@ -12,6 +12,11 @@ không tự đặt số phiên bản. Phần kiểm thử phân biệt kết qu�
 - Khi bot khởi động, dùng cùng quy trình với `/start` để mở Codex và chờ App
   sẵn sàng rồi mới quét các chat đã chọn. Nếu mở/chờ thất bại, báo lỗi và thử
   lại; bot vẫn nhận lệnh Telegram trong lúc chờ.
+- Cho phép tài khoản Telegram thứ hai điều khiển khi là chủ nhóm/admin của
+  đúng group đã liên kết. Kiểm tra quyền bằng getChatMember mỗi tin/bấm nút;
+  mất quyền admin thì bị chặn ngay. Private chat vẫn chỉ dành cho chủ bot.
+- Từ chối thành viên thường, bot, tin gửi ẩn danh/thay mặt channel và group
+  khác. Nếu Telegram không xác nhận được quyền thì không thực hiện lệnh.
 
 ## 24/10/2026 — Đặt tên chat, nhận tài liệu và điều khiển Codex
 

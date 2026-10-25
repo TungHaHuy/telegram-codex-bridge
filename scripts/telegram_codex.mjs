@@ -264,10 +264,20 @@ function menuContext(message) {
   return message.chat.id + ':' + (message.message_thread_id || 0);
 }
 
-export function authorized(message, owner, groupId) {
-  return !!owner && message.from?.id === owner && (
-    (message.chat?.type === 'private' && message.chat.id === owner) ||
-    (groupId < 0 && message.chat?.type === 'supergroup' && message.chat.id === groupId));
+export async function authorized(message, owner, groupId, getMember) {
+  const sender = message.from;
+  if (!owner || !Number.isSafeInteger(sender?.id) || sender.id <= 0 || sender.is_bot || message.sender_chat) return false;
+  if (message.chat?.type === 'private') return sender.id === owner && message.chat.id === owner;
+  if (!(groupId < 0 && message.chat?.type === 'supergroup' && message.chat.id === groupId)) return false;
+  if (sender.id === owner) return true;
+  if (!getMember) return false;
+  try {
+    const member = await getMember({ chat_id: groupId, user_id: sender.id });
+    return member.user?.id === sender.id && !member.user.is_bot && ['creator', 'administrator'].includes(member.status);
+  } catch (error) {
+    console.error('Kiểm tra quyền Telegram:', error.message);
+    return false;
+  }
 }
 
 export function destination(message, state) {
@@ -791,7 +801,8 @@ export class Bridge {
   async handle(update) {
     const message = update.message || update.callback_query?.message;
     const sender = update.callback_query?.from || message?.from;
-    if (!message || !authorized({ ...message, from: sender }, this.config.ownerId, this.config.chatId)) return;
+    if (!message || !await authorized({ ...message, from: sender }, this.config.ownerId, this.config.chatId,
+      args => this.telegram('getChatMember', args))) return;
     const controlReply = text => this.send(text, null, { chat_id: message.chat.id,
       ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }) });
     if (update.message && message.message_thread_id != null) {
