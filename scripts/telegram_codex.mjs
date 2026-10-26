@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createInterface } from 'node:readline';
 import { controlCodexApp, modelCatalog, threadSnapshot, approvalChoices, ensureOwner } from './telegram_codex_controls.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -70,6 +71,84 @@ export async function appCall(callerThreadId, tool, args) {
   const text = response.contentItems?.filter(item => item.type === 'inputText').map(item => item.text).join('\n');
   if (!response.success) throw new Error(text || 'Codex App từ chối thao tác.');
   try { return JSON.parse(text); } catch { return { message: text }; }
+}
+
+export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')) {
+  if (!/^[a-f0-9-]{36}$/i.test(threadId)) throw new Error('ID chat local không hợp lệ.');
+  const root = path.join(codexHome, 'sessions');
+  const files = fs.readdirSync(root, { recursive: true }).filter(name => name.endsWith('-' + threadId + '.jsonl'));
+  if (files.length !== 1) throw new Error('Không xác định được đúng một file lịch sử local của chat.');
+  const anchor = cursor ? JSON.parse(cursor) : null;
+  if (anchor && (anchor.requestedThreadId !== threadId || anchor.scope?.kind !== 'turns' ||
+      !Number.isSafeInteger(anchor.rolloutOrdinal) || anchor.rolloutOrdinal < 0 || typeof anchor.includeAnchor !== 'boolean')) {
+    throw new Error('Mốc lịch sử không hỗ trợ đọc local; chưa đồng bộ.');
+  }
+  let ordinal = -1, bound = false, anchorFound = !anchor, turn, hasPrevious = false;
+  const input = fs.createReadStream(path.join(root, files[0]));
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of lines) {
+      ordinal++;
+      const prefix = line.slice(0, 1024);
+      // Skip image/tool payloads before parsing: the fallback only projects visible messages.
+      const isAnchor = anchor && ordinal === anchor.rolloutOrdinal;
+      if (!isAnchor && !/"type"\s*:\s*"(?:session_meta|event_msg)"/.test(prefix)) continue;
+      if (!isAnchor && /"type"\s*:\s*"item_(?:completed|started)"/.test(prefix) &&
+          !/"type"\s*:\s*"(?:UserMessage|AgentMessage|FunctionCallOutput)"/.test(prefix)) continue;
+      const row = JSON.parse(line), p = row.payload || {};
+      if (row.type === 'session_meta') {
+        if (p.id !== threadId) throw new Error('File lịch sử không khớp ID chat.');
+        bound = true;
+      }
+      if (isAnchor) {
+        if (row.type !== 'event_msg' || p.type !== 'task_started') throw new Error('Mốc Codex không khớp file local; chưa đồng bộ.');
+        anchorFound = true;
+      }
+      if (row.type !== 'event_msg') continue;
+      if (p.type === 'task_started') {
+        if (anchor && (ordinal > anchor.rolloutOrdinal || (isAnchor && !anchor.includeAnchor))) break;
+        hasPrevious = !!turn;
+        turn = { id: p.turn_id, status: 'inProgress', items: [], ordinal };
+        continue;
+      }
+      if (!turn || p.turn_id !== turn.id) continue;
+      if (p.type === 'task_complete') turn.status = 'completed';
+      if (p.type === 'turn_aborted') turn.status = 'interrupted';
+      if (p.type !== 'item_completed') continue;
+      const item = p.item;
+      if (item?.type === 'UserMessage') turn.items.push({ type: 'userMessage', id: item.id,
+        content: (item.content || []).map(part => part.type === 'text' ? { type: 'text', text: part.text } : { type: 'image' }) });
+      if (item?.type === 'AgentMessage') {
+        const question = item.delivery === 'async' && Array.isArray(item.questions);
+        const text = question ? item.questions.map(q => q.title + (q.options?.length ? '\n' + q.options.map(o => '- ' + o).join('\n') : '')).join('\n\n') :
+          (item.content || []).filter(part => part.type === 'Text').map(part => part.text).join('\n');
+        turn.items.push({ type: 'agentMessage', id: item.id, text, phase: question ? 'final_answer' : item.phase });
+      }
+      if (item?.type === 'FunctionCallOutput' && item.namespace === 'codex_app' &&
+          ['create_thread', 'send_message_to_thread'].includes(item.name)) {
+        turn.items.push({ type: 'functionCallOutput', id: item.id, namespace: item.namespace, name: item.name, output: item.output });
+      }
+    }
+  } finally { lines.close(); input.destroy(); }
+  if (!bound || !anchorFound) throw new Error('Chưa xác minh được file/mốc lịch sử local.');
+  const nextCursor = turn && hasPrevious ? JSON.stringify({ requestedThreadId: threadId,
+    rolloutOrdinal: turn.ordinal, includeAnchor: false, scope: { kind: 'turns' } }) : null;
+  if (turn) delete turn.ordinal;
+  return { thread: { id: threadId }, turns: turn ? [turn] : [], page: { nextCursor } };
+}
+
+export async function readThread(call, args, codexHome) {
+  try { return await call('read_thread', args); }
+  catch (error) {
+    if (!error.message.startsWith('Thread history exceeds the read size limit.')) throw error;
+    const result = await readLocalTurnPage(args.threadId, args, codexHome);
+    if (!args.cursor) {
+      const thread = localThreads(await call('list_threads', { limit: 50 })).find(t => t.id === args.threadId);
+      if (!thread) throw new Error('Chưa đọc được trạng thái chat; chưa đồng bộ lịch sử local.');
+      result.thread = thread;
+    }
+    return result;
+  }
 }
 
 // Desktop's existing local coordination pipe. No second Codex runtime or listener.
@@ -437,7 +516,7 @@ export class Bridge {
   constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal, interrupt = interruptChat, readProjectState = readCodexProjectState) {
     this.config = config;
     this.state = state;
-    this.call = call;
+    this.call = (tool, args) => tool === 'read_thread' ? readThread(call, args) : call(tool, args);
     this.telegram = telegram;
     this.persist = persist;
     this.receiveImage = receiveImage;

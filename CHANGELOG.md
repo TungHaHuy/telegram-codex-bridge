@@ -3,6 +3,23 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 26/10/2026 — Sửa lượt lịch sử quá lớn và đăng nhập bằng mã
+
+- Khi App Tools không đọc được một lượt vì vượt giới hạn kích thước, bridge
+  đọc tin nhắn từ đúng file lịch sử local. Giữ ID và mốc trang để chống lặp;
+  không chuyển reasoning, log công cụ, ảnh nhúng hoặc chỉ dẫn môi trường.
+  Mốc hoặc ID không khớp sẽ báo lỗi; file lịch sử gốc không bị sửa.
+- Đã tái hiện lỗi trên một rollout gần 196 MB; trang lỗi được đọc thành
+  14 item tin nhắn, khoảng 6,8 KB. So khớp một lượt thật với App Tools cho kết
+  quả trùng ID/nội dung; bot đã đồng bộ lại chat bị lỗi mà không chạy lại prompt.
+- Thêm `node scripts/telegram_user.mjs --login --phone` để đăng nhập bằng số
+  điện thoại và mã Telegram thay cho QR. Giữ QR mặc định và kiểm tra đúng chủ
+  bot trước khi lưu phiên; mã và mật khẩu hai lớp không được in ra log.
+  Telegram quyết định phương thức gửi mã, không ép SMS.
+- Kiểm thử tự động bao phủ nguồn/cursor lịch sử, lọc dữ liệu riêng, chống lặp,
+  đường đăng nhập bằng mã/QR và từ chối lưu phiên sai chủ. Đăng nhập bằng mã
+  cũng đã được người dùng hoàn tất và xác minh đúng tài khoản trên máy triển khai.
+
 ## 26/10/2026 — Gộp danh sách chọn project/chat
 
 - `/projects` và `/chats` gửi một menu đầy đủ thay vì tự chia mỗi 10 nút thành

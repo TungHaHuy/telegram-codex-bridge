@@ -166,6 +166,11 @@ cần đăng nhập thêm Telegram cá nhân bằng MTProto. Chỉ bật nếu b
    node scripts/telegram_user.mjs --login
    ```
 
+   Nếu muốn nhận mã trong Telegram máy tính thay cho QR, chạy
+   `node scripts/telegram_user.mjs --login --phone`, nhập số điện thoại có mã
+   quốc gia rồi nhập mã Telegram gửi ngay trong cửa sổ đăng nhập. Chương trình
+   không ép gửi SMS; phương thức gửi mã thực tế do Telegram quyết định.
+
 3. Nhập api_id/api_hash khi được hỏi. Mở `.telegram-codex/user-login-qr.png`,
    dùng Telegram điện thoại → Settings → Devices → Link Desktop Device để quét.
    Nếu có mật khẩu 2 bước, nhập trong terminal (ẩn ký tự). QR được làm mới khi
@@ -304,6 +309,10 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   từ App. Khi steer một lượt desktop từ Telegram, phần sau prompt steer tự cập nhật;
   phần desktop trước prompt đó nằm ngoài phạm vi `/update` và không nhập lại.
   Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
+- Nếu App Tools báo một lượt vượt giới hạn đọc, bridge đọc riêng tin nhắn từ
+  file lịch sử local của đúng chat, giữ ID và mốc trang để không gửi trùng.
+  Không chuyển reasoning, log công cụ hoặc dữ liệu ảnh nhúng. File gốc không
+  bị sửa; nếu không khớp ID/mốc trang thì báo lỗi và không đoán lịch sử.
 - Chờ quyền được phát hiện bằng trạng thái `waitingOnApproval`, kiểm tra mỗi 3 giây.
   Bot gửi nội dung và nút quyết định cho loại yêu cầu đã hỗ trợ; các loại khác
   vẫn báo để xem và xử lý trong Codex App.

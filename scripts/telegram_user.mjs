@@ -65,15 +65,29 @@ async function login() {
   try {
     await client.connect();
     if (!await client.checkAuthorization()) {
-      const QRCode = dependency('qrcode');
-      await client.signInUserWithQrCode({ apiId: data.apiId, apiHash: data.apiHash }, {
-        qrCode: async code => {
-          await QRCode.toFile(path.join(LOCAL, 'user-login-qr.png'), 'tg://login?token=' + code.token.toString('base64url'));
-          console.log('Mở .telegram-codex/user-login-qr.png; Telegram điện thoại → Settings → Devices → Link Desktop Device để quét.');
-        },
+      const credentials = { apiId: data.apiId, apiHash: data.apiHash };
+      const auth = {
         password: () => ask('Mat khau Telegram 2 buoc (an, neu co): ', true),
         onError: async error => { throw error; },
-      });
+      };
+      if (process.argv.includes('--phone')) {
+        await client.signInUser(credentials, {
+          ...auth,
+          phoneNumber: () => ask('So dien thoai Telegram (gom ma quoc gia, vi du +84...): '),
+          phoneCode: viaApp => ask(viaApp ? 'Ma vua gui vao Telegram tren may tinh (an): ' :
+            'Ma dang nhap Telegram vua gui (an): ', true),
+          forceSMS: false,
+        });
+      } else {
+        const QRCode = dependency('qrcode');
+        await client.signInUserWithQrCode(credentials, {
+          ...auth,
+          qrCode: async code => {
+            await QRCode.toFile(path.join(LOCAL, 'user-login-qr.png'), 'tg://login?token=' + code.token.toString('base64url'));
+            console.log('Mở .telegram-codex/user-login-qr.png; Telegram điện thoại → Settings → Devices → Link Desktop Device để quét.');
+          },
+        });
+      }
     }
     const me = await client.getMe();
     if (me.bot || String(me.id) !== String(config.ownerId)) throw new Error('Đăng nhập nhầm tài khoản; cần đúng chủ bot đã ghép.');
