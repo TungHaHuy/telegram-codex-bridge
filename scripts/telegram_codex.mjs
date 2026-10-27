@@ -95,7 +95,10 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
       if (!isAnchor && !/"type"\s*:\s*"(?:session_meta|event_msg)"/.test(prefix)) continue;
       if (!isAnchor && /"type"\s*:\s*"item_(?:completed|started)"/.test(prefix) &&
           !/"type"\s*:\s*"(?:UserMessage|AgentMessage|FunctionCallOutput)"/.test(prefix)) continue;
-      const row = JSON.parse(line), p = row.payload || {};
+      let row;
+      try { row = JSON.parse(line); }
+      catch { if (!line.endsWith('}')) continue; throw new Error('Bản lưu lịch sử local có dữ liệu JSON không hợp lệ.'); }
+      const p = row.payload || {};
       if (row.type === 'session_meta') {
         if (p.id !== threadId) throw new Error('File lịch sử không khớp ID chat.');
         bound = true;
@@ -114,6 +117,7 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
       if (!turn || p.turn_id !== turn.id) continue;
       if (p.type === 'task_complete') turn.status = 'completed';
       if (p.type === 'turn_aborted') turn.status = 'interrupted';
+      if (p.type === 'error') turn.error = { message: p.message };
       if (p.type !== 'item_completed') continue;
       const item = p.item;
       if (item?.type === 'UserMessage') turn.items.push({ type: 'userMessage', id: item.id,
@@ -126,14 +130,19 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
       }
       if (item?.type === 'FunctionCallOutput' && item.namespace === 'codex_app' &&
           ['create_thread', 'send_message_to_thread'].includes(item.name)) {
-        turn.items.push({ type: 'functionCallOutput', id: item.id, namespace: item.namespace, name: item.name, output: item.output });
+        turn.items.push({ type: 'functionCallOutput', id: item.id, namespace: item.namespace, name: item.name,
+          output: typeof item.output === 'string' ? { text: item.output } : item.output });
       }
     }
   } finally { lines.close(); input.destroy(); }
   if (!bound || !anchorFound) throw new Error('Chưa xác minh được file/mốc lịch sử local.');
   const nextCursor = turn && hasPrevious ? JSON.stringify({ requestedThreadId: threadId,
     rolloutOrdinal: turn.ordinal, includeAnchor: false, scope: { kind: 'turns' } }) : null;
-  if (turn) delete turn.ordinal;
+  if (turn) {
+    delete turn.ordinal;
+    // These items are completed: do not suppress the last message as a streaming item.
+    if (turn.status === 'inProgress') turn.items.push({ type: 'localReadBoundary' });
+  }
   return { thread: { id: threadId }, turns: turn ? [turn] : [], page: { nextCursor } };
 }
 

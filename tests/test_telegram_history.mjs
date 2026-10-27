@@ -16,7 +16,7 @@ const rows = [
   { type: 'session_meta', payload: { id } }, start('one'),
   { type: 'response_item', payload: { role: 'user', content: [{ text: 'AGENTS_MUST_NOT_BE_FORWARDED' }] } },
   item('one', { type: 'FunctionCallOutput', id: 'delegation', namespace: 'codex_app', name: 'send_message_to_thread',
-    output: { text: '<codex_delegation>\n<source_thread_id>bridge</source_thread_id>\n<input>First prompt</input>\n</codex_delegation>' } }),
+    output: '<codex_delegation>\n<source_thread_id>bridge</source_thread_id>\n<input>First prompt</input>\n</codex_delegation>' }),
   item('one', { type: 'CommandExecution', id: 'large-tool', aggregated_output: 'PRIVATE_TOOL_OUTPUT'.repeat(10000) }),
   item('one', { type: 'Reasoning', id: 'reason', raw_content: 'PRIVATE_REASONING' }),
   item('one', { type: 'ImageView', id: 'image', data: 'PRIVATE_IMAGE_BYTES' }),
@@ -26,6 +26,7 @@ const rows = [
   item('two', { type: 'AgentMessage', id: 'reply-two', phase: 'final_answer', content: [{ type: 'Text', text: 'Second reply' }] }),
   event('two', { type: 'turn_aborted' }), start('three'),
   item('three', { type: 'AgentMessage', id: 'call_question', delivery: 'async', questions: [{ title: 'Choose?', options: ['A', 'B'] }] }),
+  item('three', { type: 'AgentMessage', id: 'progress', phase: 'commentary', content: [{ type: 'Text', text: 'Completed progress' }] }),
 ];
 const second = rows.findIndex(r => r.payload?.type === 'task_started' && r.payload.turn_id === 'two');
 const third = rows.findIndex(r => r.payload?.type === 'task_started' && r.payload.turn_id === 'three');
@@ -37,7 +38,7 @@ try {
   const latest = await readLocalTurnPage(id, {}, root);
   assert.equal(latest.turns[0].status, 'inProgress');
   assert.deepEqual(conversationEvents(latest.turns), [{ key: 'call_question', text: 'Choose?\n- A\n- B', role: 'assistant',
-    turnId: 'three', question: true, activeQuestion: true }]);
+    turnId: 'three', question: true, activeQuestion: true }, { key: 'progress', text: 'Completed progress', role: 'assistant', turnId: 'three' }]);
   const middle = await readLocalTurnPage(id, { cursor: latest.page.nextCursor }, root);
   assert.equal(middle.turns[0].id, 'two');
   assert.equal(middle.turns[0].status, 'interrupted');
@@ -77,6 +78,30 @@ try {
   await bridge.scan(); await bridge.scan();
   assert.deepEqual(sent, ['[Test]\nChoose?\n- A\n- B'], 'fallback questions arrive once with original IDs');
   assert.equal(bridge.state.awaitingQuestions[id], 'call_question');
+  const syncMessages = [];
+  const sync = new Bridge({ ownerId: 42, callerThreadId: 'bridge' }, {
+    selected: id, routes: {}, seen: { [id]: { turnId: 'one', keys: [] } },
+    threads: { [id]: { title: 'Test' } }, enabled: { [id]: true }, telegramPrompts: { [id]: ['First prompt'] },
+  }, async (tool, args) => tool === 'list_threads' ? { threads: [{ ...metadata, status: { type: 'active', activeFlags: [] } }], pinnedThreads: [] } :
+    Promise.reject(new Error(limit)), async (method, args) => { syncMessages.push(args.text); return { message_id: syncMessages.length }; }, () => {});
+  await sync.scan();
+  assert.equal(sync.state.sources.delegation, 'telegram', 'raw string delegation preserves Telegram attribution');
+  assert(!syncMessages.some(text => text.includes('First reply')), 'native desktop steer remains manual');
+  await sync.update(id);
+  assert(syncMessages.some(text => text.includes('First reply')));
+  assert(syncMessages.some(text => text.includes('Steer')));
+  const deliveredReplyCount = syncMessages.filter(text => text.includes('First reply')).length;
+  await sync.update(id);
+  assert.equal(syncMessages.filter(text => text.includes('First reply')).length, deliveredReplyCount);
+  const historyMessages = [];
+  const importer = new Bridge({ ownerId: 42 }, { threads: { [id]: { title: 'Test' } }, routes: {}, seen: {} },
+    async tool => tool === 'list_threads' ? { threads: [metadata], pinnedThreads: [] } : Promise.reject(new Error(limit)),
+    async (method, args) => { historyMessages.push(args.text); return { message_id: historyMessages.length }; }, () => {});
+  await importer.importRecentHistory(id);
+  assert(historyMessages.some(text => text.includes('First prompt')));
+  assert(historyMessages.some(text => text.includes('First reply')));
+  fs.appendFileSync(file, '{"type":"event_msg",');
+  assert.equal((await readLocalTurnPage(id, {}, root)).turns[0].id, 'three', 'live partial tail does not break completed history');
   fs.writeFileSync(file, [{ type: 'session_meta', payload: { id: 'wrong' } }, ...rows.slice(1)].map(r => JSON.stringify(r)).join('\n'));
   await assert.rejects(readLocalTurnPage(id, {}, root), /không khớp ID/);
   console.log('telegram_history: oversized-page fallback, native cursor/IDs, no private payloads, runtime flags and deduplication passed.');

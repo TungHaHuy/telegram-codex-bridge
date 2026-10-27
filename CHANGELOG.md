@@ -3,6 +3,16 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 27/10/2026 — Khôi phục prompt và tin nhắn ở lượt lịch sử quá lớn
+
+- Nhánh đọc local nhận đúng cả delegation dạng chuỗi và dạng object của Codex,
+  giữ nguồn Telegram để phản hồi tự gửi về đúng topic.
+- Tin đã hoàn tất cuối một lượt đang chạy không bị nhầm là tin còn streaming;
+  phần ghi JSON chưa hoàn tất ở cuối file đang chạy không chặn đọc lịch sử.
+- Kiểm tra với lượt lỗi thật: phục hồi prompt và câu trả lời cuối từ rollout
+  hơn 225 MB thành khoảng 12 KB tin nhắn; giữ ID/nội dung trùng App ở lượt đọc được.
+- Test bao phủ scan, /update, nhập lịch sử và chống gửi trùng khi fallback.
+
 ## 26/10/2026 — Sửa lượt lịch sử quá lớn và đăng nhập bằng mã
 
 - Khi App Tools không đọc được một lượt vì vượt giới hạn kích thước, bridge
