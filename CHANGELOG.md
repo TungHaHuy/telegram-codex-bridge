@@ -3,6 +3,17 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 27/10/2026 — Tự đồng bộ hoạt động desktop
+
+- Tự phát hiện chat local mới, tạo topic tương ứng và chuyển prompt/phản hồi
+  mới từ desktop sang Telegram. Không cần chọn chat trước hoặc dùng `/update`.
+- Dùng vòng kiểm tra khoảng 3 giây; chỉ đọc lại chat đang chạy hoặc thay đổi.
+  Đây là đồng bộ gần thời gian thực, độ trễ còn phụ thuộc Codex và Telegram.
+- Lần đầu bật ghi mốc hiện tại của chat cũ để không đổ lại lịch sử. Mốc lưu qua
+  lần khởi động tiếp theo; dữ liệu mới sau mốc được đồng bộ, không gửi trùng.
+- Giữ tuyến theo topic, phân quyền chủ/admin, chống chạy lại prompt chép lịch sử,
+  xử lý cấp quyền và file đính kèm. `/update` còn để tương thích cách đồng bộ cũ.
+
 ## 27/10/2026 — Khôi phục prompt và tin nhắn ở lượt lịch sử quá lớn
 
 - Nhánh đọc local nhận đúng cả delegation dạng chuỗi và dạng object của Codex,

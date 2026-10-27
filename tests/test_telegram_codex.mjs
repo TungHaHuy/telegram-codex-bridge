@@ -248,6 +248,71 @@ const delegatedTurn = (id, prompt, reply, caller = 'bridge') => ({ id, status: '
     output: { text: '<codex_delegation>\n<source_thread_id>' + caller + '</source_thread_id>\n<input>' + prompt + '</input>\n</codex_delegation>' } },
   { type: 'agentMessage', id: id + '-reply', text: reply },
 ] });
+
+// Realtime startup establishes a baseline, then discovers desktop chats and forwards both roles.
+let liveInventory = [{ ...t, status: 'idle' }];
+const liveTurns = { A: [desktopTurn('old', 'OLD_DESKTOP_HISTORY')] };
+const liveMessages = [], liveReads = [];
+const liveState = { topicMode: true, threads: { A: liveInventory[0] }, routes: {}, seen: {} };
+const liveCall = async (tool, args) => {
+  if (tool === 'list_threads') {
+    assert.equal(args.limit, 50);
+    return { threads: [...liveInventory, { ...t, id: 'cloud', hostId: 'remote' }, { ...t, id: 'chatgpt', kind: 'chatgpt' }], pinnedThreads: [] };
+  }
+  assert.equal(tool, 'read_thread'); liveReads.push(args.threadId);
+  return { turns: liveTurns[args.threadId], page: {}, thread: { status: { type: 'idle', activeFlags: [] } } };
+};
+const liveTelegram = async (method, args) => {
+  liveMessages.push({ method, args });
+  return method === 'createForumTopic' ? { message_thread_id: 800 + liveMessages.length } : { message_id: liveMessages.length };
+};
+const liveBridge = new Bridge({ ownerId: owner, chatId: -1001234, callerThreadId: 'bridge' }, liveState, liveCall, liveTelegram, () => {});
+await liveBridge.scanDesktop();
+assert.equal(liveMessages.length, 0, 'first enablement must not dump old history or create old topics');
+const afterBaselineReads = liveReads.length;
+await liveBridge.scanDesktop();
+assert.equal(liveReads.length, afterBaselineReads, 'unchanged idle chats are not reread');
+liveInventory[0] = { ...liveInventory[0], updatedAt: 2 };
+liveTurns.A.unshift(desktopTurn('desktop-new', 'DESKTOP_REALTIME_OK'));
+await liveBridge.scanDesktop();
+assert(liveState.topics.A, 'desktop activity creates a topic without selection');
+assert(liveMessages.some(m => m.args.text?.includes('desktop desktop-new')));
+assert(liveMessages.some(m => m.args.text?.includes('DESKTOP_REALTIME_OK')));
+assert(!JSON.stringify(liveMessages).includes('OLD_DESKTOP_HISTORY'));
+liveInventory.push({ ...t, id: 'NEW', title: 'New desktop chat', status: 'idle', updatedAt: 3 });
+liveTurns.NEW = [desktopTurn('first', 'NEW_CHAT_RESPONSE')];
+await liveBridge.scanDesktop();
+assert(liveState.topics.NEW);
+assert(liveMessages.some(m => m.args.text?.includes('desktop first') && m.args.message_thread_id === liveState.topics.NEW));
+assert(liveMessages.some(m => m.args.text?.includes('NEW_CHAT_RESPONSE') && m.args.message_thread_id === liveState.topics.NEW));
+liveInventory[0] = { ...liveInventory[0], updatedAt: 3, status: 'active' };
+const liveStream = desktopTurn('stream-desktop', 'WAIT_FOR_COMPLETE', 'inProgress');
+liveTurns.A.unshift(liveStream);
+await liveBridge.scanDesktop();
+assert(!liveMessages.some(m => m.args.text?.includes('WAIT_FOR_COMPLETE')));
+liveStream.status = 'completed'; liveInventory[0].status = 'idle'; // Same updatedAt second.
+await liveBridge.scanDesktop();
+assert(liveMessages.some(m => m.args.text?.includes('WAIT_FOR_COMPLETE')), 'active -> idle still checks the final message');
+const beforeLiveRestart = liveMessages.length;
+const liveRestart = new Bridge({ ownerId: owner, chatId: -1001234, callerThreadId: 'bridge' },
+  JSON.parse(JSON.stringify(liveState)), liveCall, liveTelegram, () => {});
+await liveRestart.scanDesktop();
+assert.equal(liveMessages.length, beforeLiveRestart, 'restart must not replay delivered history');
+liveInventory[0] = { ...liveInventory[0], updatedAt: 4 };
+liveTurns.A.unshift(desktopTurn('offline-change', 'DESKTOP_WHILE_OFFLINE'));
+await liveRestart.scanDesktop();
+assert(liveMessages.some(m => m.args.text?.includes('DESKTOP_WHILE_OFFLINE')));
+assert(liveReads.every(id => !['cloud', 'chatgpt'].includes(id)));
+liveRestart.creatingChat = true;
+liveInventory.push({ ...t, id: 'CREATING', title: 'Creation in flight', status: 'idle', updatedAt: 5 });
+liveTurns.CREATING = [desktopTurn('creation-in-flight', 'CREATION_DONE')];
+await liveRestart.scanDesktop();
+assert(!liveRestart.state.topics.CREATING, 'discovery must wait for Telegram creation to register its initial prompt');
+liveRestart.creatingChat = false;
+await liveRestart.scanDesktop();
+assert(liveRestart.state.topics.CREATING);
+assert(liveMessages.some(m => m.args.text?.includes('CREATION_DONE')));
+
 // XML/code is escaped by Codex before read_thread returns the delegated prompt.
 const xmlPrompt = '<entry title="test">Tom & Jerry &lt;literal&gt;</entry>';
 const escapedXml = '&lt;entry title=&quot;test&quot;&gt;Tom &amp; Jerry &amp;lt;literal&amp;gt;&lt;/entry&gt;';

@@ -547,7 +547,7 @@ export class Bridge {
     this.state.newChats ||= {};
     this.state.ignoredPrompts ||= {};
     this.state.historyPending ||= {};
-    // Old auto-created topics are dormant until selected or used again.
+    // Explicit selection works before the first realtime inventory is available.
     this.state.enabled ||= this.state.selected ? { [this.state.selected]: true } : {};
     this.state.delivered ||= {};
     this.state.telegramPrompts ||= {};
@@ -1016,7 +1016,7 @@ export class Bridge {
       });
     }
     if (command === '/help') {
-      return controlReply('/start — bật Codex\n/restart — tắt rồi mở lại Codex (ngắt các lượt đang chạy)\n/model — đổi model cho chat đang chọn\n/effort — đổi mức suy nghĩ cho model hiện tại\n/projects — chọn project, mở chat gần đây hoặc New chat\nNew chat → đặt tên → gửi prompt đầu tiên (có thể kèm ảnh/file).\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer; phản hồi Telegram tự cập nhật.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: chọn bằng nút khi có; yêu cầu không hỗ trợ thì xử lý trong App.');
+      return controlReply('/start — bật Codex\n/restart — tắt rồi mở lại Codex (ngắt các lượt đang chạy)\n/model — đổi model cho chat đang chọn\n/effort — đổi mức suy nghĩ cho model hiện tại\n/projects — chọn project, mở chat gần đây hoặc New chat\nNew chat → đặt tên → gửi prompt đầu tiên (có thể kèm ảnh/file).\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer. Chat, prompt và phản hồi mới trên desktop tự đồng bộ; không cần /update.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: chọn bằng nút khi có; yêu cầu không hỗ trợ thì xử lý trong App.');
     }
     if (command === '/chats') {
       const threads = await this.chats();
@@ -1097,8 +1097,23 @@ export class Bridge {
     }
   }
 
+  async scanDesktop() {
+    const threads = localThreads(await this.call('list_threads', { limit: 50 }), this.readProjectState());
+    // First enablement establishes a baseline; subsequent discoveries are new chats.
+    if (!this.state.realtimeBaseline) {
+      this.state.realtimeBaseline = Object.fromEntries(
+        [...new Set([...Object.keys(this.state.threads), ...threads.map(t => t.id)])].map(id => [id, true]));
+      for (const id of Object.keys(this.state.realtimeBaseline)) this.state.enabled[id] = true;
+    }
+    for (const thread of threads) {
+      this.state.threads[thread.id] = thread;
+      this.state.enabled[thread.id] = true;
+    }
+    this.persist();
+    await this.scan();
+  }
+
   async scan() {
-    // Selection is explicit. Neither recent desktop chats nor old routes opt in.
     for (const id of Object.keys(this.state.enabled).filter(id => this.state.enabled[id])) {
       const thread = this.state.threads[id];
       if (!thread) continue;
@@ -1106,6 +1121,13 @@ export class Bridge {
       if (this.state.pending?.kind === 'create' && this.state.pending.threadId === id) continue;
       try {
         const prior = this.state.seen[id];
+        const realtime = !!this.state.realtimeBaseline;
+        const baseline = !!this.state.realtimeBaseline?.[id];
+        if (realtime && !prior && this.creatingChat) continue;
+        const active = (typeof thread.status === 'string' ? thread.status : thread.status?.type) === 'active';
+        if (realtime && !baseline && prior && !active && !prior.wasActive &&
+          prior.updatedAt === thread.updatedAt && !this.state.telegramPrompts[id]?.length) continue;
+        if (realtime && !baseline && !prior && this.state.topicMode) await this.topic(id);
         const turns = [];
         let cursor, status;
         // Walk back to the last observed turn, so fast consecutive turns aren't lost.
@@ -1117,7 +1139,7 @@ export class Bridge {
           status ||= result.thread?.status;
           turns.push(...(result.turns || []));
           cursor = result.page?.nextCursor;
-        } while (prior && cursor && !turns.some(t => t.id === prior.turnId));
+        } while (prior && !baseline && cursor && !turns.some(t => t.id === prior.turnId));
         const flags = status?.activeFlags || [];
         const waiting = flags.filter(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag));
         if (waiting.length) {
@@ -1135,17 +1157,24 @@ export class Bridge {
         for (const event of all) {
           // Questions need attention even for desktop prompts; do not backfill old completed questions.
           const newQuestion = event.question && (event.activeQuestion || (prior && !prior.keys.includes(event.key)));
-          if (event.origin === 'telegram' || newQuestion) await this.deliver(id, event, !!newQuestion);
+          if (realtime ? !baseline && !prior?.keys?.includes(event.key) : event.origin === 'telegram' || newQuestion) {
+            await this.deliver(id, event, !!newQuestion);
+          }
         }
         this.state.seen[id] = {
           turnId: turns[0]?.id,
           keys: all.map(event => event.key),
+          updatedAt: thread.updatedAt,
+          wasActive: (status?.type || (active ? 'active' : 'idle')) === 'active' || turns[0]?.status === 'inProgress',
         };
+        if (status) thread.status = status;
+        if (baseline) delete this.state.realtimeBaseline[id];
         this.persist();
         this.readErrors.delete(id);
       } catch (error) {
         if (this.readErrors.get(id) !== error.message) {
-          await this.send('Không đọc được chat: ' + error.message, id);
+          if (this.state.realtimeBaseline?.[id]) console.error('Chưa ghi được mốc chat local:', error.message);
+          else await this.send('Không đọc được chat: ' + error.message, id);
           this.readErrors.set(id, error.message);
         }
       }
@@ -1263,7 +1292,7 @@ async function main() {
     delete state.pending;
     bridge.persist();
   }
-  await bridge.send('Bot Telegram đã bật, đang kiểm tra và mở Codex. /start mở Codex, /restart mở lại nếu bị treo. /projects chọn chat; /model đổi model; /update lấy tin desktop.');
+  await bridge.send('Bot Telegram đã bật, đang mở Codex. Chat, prompt và phản hồi mới trên máy sẽ tự đồng bộ về Telegram. /projects chọn chat; /model đổi model.');
   console.log('Bot đang chạy. Ctrl+C để dừng.');
   // Independent loops: a slow Codex read must not block incoming steering.
   void (async () => {
@@ -1273,9 +1302,9 @@ async function main() {
         if (!ready) {
           ready = await bridge.startApp();
           if (!ready) throw new Error('Đã yêu cầu mở Codex nhưng App chưa trả lời. Bot sẽ thử lại.');
-          console.log('Codex đã sẵn sàng, bắt đầu đọc các chat đã chọn.');
+          console.log('Codex đã sẵn sàng, bắt đầu tự đồng bộ các chat local.');
         }
-        await bridge.scan(); lastError = '';
+        await bridge.scanDesktop(); lastError = '';
       }
       catch (error) {
         console.error('Đọc Codex:', error.message);

@@ -19,21 +19,24 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 - Prompt đầu tiên được chép từ nơi tạo sang topic mới trước phản hồi Codex;
   tin chép dùng cơ chế replay lịch sử nên không chạy lại yêu cầu.
 - Mỗi chat có topic Telegram riêng khi dùng nhóm bật Topics.
-- Chỉ chat được chọn hoặc được bạn nhắn trong topic mới được theo dõi; chọn chat
-  từ menu nhập tối đa 20 lượt hỏi–đáp đã hoàn tất gần nhất một lần, chat mới trên desktop không tự xuất hiện.
-- Nhắn trong topic để gửi prompt hoặc steer; phản hồi/lỗi từ prompt Telegram tự về.
+- Tự phát hiện chat local mới trên desktop và tạo topic; prompt, phản hồi và lỗi
+  mới tự chuyển về Telegram, không cần chọn chat trước hay dùng `/update`.
+  Kiểm tra khoảng 3 giây; chat đứng yên được bỏ qua, độ trễ còn phụ thuộc App/Telegram.
+- Lần đầu bật ghi mốc chat cũ, không đổ lại lịch sử; mốc được giữ qua lần khởi động.
+  Chọn chat từ menu vẫn nhập tối đa 20 lượt hỏi–đáp đã hoàn tất gần nhất một lần.
+- Nhắn trong topic để gửi prompt hoặc steer; tin được chép từ desktop không chạy lại.
 - Đường dẫn file local trong phản hồi được thay bằng file đính kèm, xen giữa
   các đoạn chữ theo đúng thứ tự. Hỗ trợ link Markdown, đường dẫn trong backtick
   và đường dẫn Windows thông thường; link web giữ nguyên. File không tồn tại,
   vượt 50 MB hoặc gửi lỗi sẽ hiện đường dẫn kèm lý do. Bot không tự gửi file
   `.env`, dữ liệu đăng nhập/runtime riêng hay thư mục; artifact trong
   `.codex/visualizations` vẫn được phép gửi.
-- `/update` lấy phần desktop chưa gửi, chỉ sau prompt Telegram gần nhất của chat.
-  Chưa có prompt Telegram thì `/update` chưa nhập tin desktop. Prompt Telegram tự cập nhật.
+- `/update` giữ để tương thích luồng đồng bộ thủ công cũ sau prompt Telegram.
+  Khi bot đang chạy bình thường, nội dung desktop mới đã được tự đồng bộ.
 - Báo ngay khi chat được chọn chờ cấp quyền hoặc chờ bạn trả lời trong App.
 - Câu hỏi lựa chọn của Codex được chuyển ngay với đầy đủ nội dung/lựa chọn,
   kể cả prompt đến từ desktop và lượt chat vẫn đang chạy; không cần `/update`.
-  Phản hồi desktop thông thường vẫn chờ `/update` như trước.
+  Phản hồi desktop thông thường cũng tự đồng bộ sau mốc khởi tạo.
 - `/cancel` dừng đúng lượt đang chạy trong topic hiện tại.
 - Gửi ảnh Photo hoặc tài liệu dưới dạng Document, có thể kèm caption làm yêu cầu.
 - `/quota` xem hạn mức tài khoản và thời điểm reset theo giờ Việt Nam.
@@ -145,10 +148,9 @@ không bị lựa chọn chat cũ hoặc Reply sang chat khác ghi đè.
 
 ## Hiển thị lịch sử đúng người gửi
 
-Chọn chat từ menu tạo/mở topic và nhập một lần 5 lượt hỏi–đáp hoàn tất gần nhất.
-Dùng `/update` để lấy phần mới từ prompt trên desktop,
-từ sau prompt Telegram gần nhất, theo thứ tự cũ đến mới, gồm prompt, lời trả lời/
-progress đã chốt và lỗi. Phần đang stream,
+Chọn chat từ menu tạo/mở topic và nhập một lần tối đa 20 lượt hỏi–đáp hoàn tất gần nhất.
+Hoạt động mới trên desktop tự chuyển về topic theo thứ tự cũ đến mới, gồm prompt,
+lời trả lời/progress đã chốt và lỗi. Phần đang stream,
 reasoning và log công cụ không được chuyển. Tin đã gửi không được nhập lại.
 
 Mặc định Bot API trích dẫn prompt bằng nhãn `Bạn:` và gửi lời trả lời từ bot.
@@ -238,7 +240,7 @@ bot thoát lỗi, launcher chờ 15 giây rồi thử lại, không giới hạn
 Task Scheduler vẫn thử lại mỗi phút, tối đa 255 lần nếu chính launcher gặp lỗi.
 Log ở `.telegram-codex/stdout.log`
 và `stderr.log`. Khi bot khởi động, bot dùng cùng quy trình với `/start` để mở
-Codex, chờ App sẵn sàng rồi mới đọc các chat đã chọn. Nếu chưa mở/kết nối được,
+Codex, chờ App sẵn sàng rồi mới bắt đầu tự đồng bộ chat local. Nếu chưa mở/kết nối được,
 bot báo lỗi và thử lại; vẫn nhận lệnh Telegram trong lúc chờ.
 
 Kiểm tra cấu hình startup và tiến trình đang chạy:
@@ -299,15 +301,15 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
 - Toàn bộ token, ID tài khoản/nhóm/chat, routes, lịch sử mốc đọc, ảnh nhận, PID
   nằm trong `.telegram-codex/`, được gitignore. Folder giới hạn quyền cho tài khoản
   Windows hiện tại và SYSTEM. Bản nguồn không chứa cấu hình cá nhân đã ghép.
-- Menu liệt kê 50 chat local gần nhất và chat ghim. Chỉ chat được chọn hoặc được
-  nhắn trong topic mới được theo dõi. Topic tự tạo từ bản cũ giữ nguyên nhưng
-  không tự theo dõi lại; chat được chọn gần nhất được giữ khi nâng cấp.
-- Khi chọn chat cũ từ menu, bot nhập một lần 5 lượt hỏi–đáp hoàn tất gần nhất,
+- Mỗi vòng lấy danh sách 50 chat gần nhất cùng chat ghim từ App, lọc chat Codex
+  local và giữ theo dõi các chat đã biết. Lần đầu nâng cấp ghi mốc chat cũ, không
+  tạo hàng loạt topic hay đổ lịch sử; chat có hoạt động mới sẽ tự có topic.
+- Khi chọn chat cũ từ menu, bot nhập một lần tối đa 20 lượt hỏi–đáp hoàn tất gần nhất,
   theo thứ tự cũ đến mới. Bỏ lượt đang chạy và log công cụ; phần đã gửi không
   bị lặp khi chọn lại. Bước nhập lịch sử này độc lập với mốc của `/update`.
 - Nguồn Telegram được nhận diện bằng prompt đã ghi trước khi gửi và item trả về
-  từ App. Khi steer một lượt desktop từ Telegram, phần sau prompt steer tự cập nhật;
-  phần desktop trước prompt đó nằm ngoài phạm vi `/update` và không nhập lại.
+  từ App để không chép lặp prompt đã có trong topic. Nội dung desktop mới cũng
+  tự cập nhật; `/update` vẫn giữ mốc prompt Telegram theo cách thủ công cũ.
   Mỗi item đọc tối đa 20.000 ký tự. Máy phải bật/mạng.
 - Nếu App Tools báo một lượt vượt giới hạn đọc, bridge đọc riêng tin nhắn từ
   file lịch sử local của đúng chat, giữ ID và mốc trang để không gửi trùng.
