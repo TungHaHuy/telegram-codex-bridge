@@ -102,6 +102,26 @@ try {
   assert(historyMessages.some(text => text.includes('First reply')));
   fs.appendFileSync(file, '{"type":"event_msg",');
   assert.equal((await readLocalTurnPage(id, {}, root)).turns[0].id, 'three', 'live partial tail does not break completed history');
+  const longReply = 'Full response '.repeat(2500);
+  const fullRows = [{ type: 'session_meta', payload: { id } }];
+  for (let n = 0; n < 25; n++) fullRows.push(start('full-' + n),
+    item('full-' + n, { type: 'UserMessage', id: 'prompt-' + n, content: [{ type: 'text', text: 'Prompt ' + n }] }),
+    item('full-' + n, { type: 'AgentMessage', id: 'full-answer-' + n, phase: 'final_answer', content: [{ type: 'Text', text: longReply }] }),
+    event('full-' + n, { type: 'task_complete' }));
+  fs.writeFileSync(file, fullRows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const full = await readLocalTurnPage(id, { all: true }, root);
+  assert.equal(full.turns.length, 25, '/full must exceed the twenty-pair history limit');
+  assert.equal(full.page.nextCursor, null);
+  assert.equal(full.turns[0].id, 'full-24'); assert.equal(full.turns.at(-1).id, 'full-0');
+  assert.equal(full.turns[0].items.at(-1).text, longReply, 'full history does not truncate responses at 20,000 characters');
+  const continuation = path.join(root, 'sessions', 'rollout-z-' + id + '_22222222-2222-2222-2222-222222222222.jsonl');
+  fs.writeFileSync(continuation, [{ type: 'session_meta', payload: { id } }, start('continued'),
+    item('continued', { type: 'UserMessage', id: 'continued-prompt', content: [{ type: 'text', text: 'Newest continuation' }] }),
+    event('continued', { type: 'task_complete' })].map(r => JSON.stringify(r)).join('\n'));
+  const continued = await readLocalTurnPage(id, { all: true }, root);
+  assert.equal(continued.turns.length, 26);
+  assert.equal(continued.turns[0].id, 'continued', '/full includes rotated session files for the same Codex chat');
+  fs.unlinkSync(continuation);
   fs.writeFileSync(file, [{ type: 'session_meta', payload: { id: 'wrong' } }, ...rows.slice(1)].map(r => JSON.stringify(r)).join('\n'));
   await assert.rejects(readLocalTurnPage(id, {}, root), /không khớp ID/);
   console.log('telegram_history: oversized-page fallback, native cursor/IDs, no private payloads, runtime flags and deduplication passed.');

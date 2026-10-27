@@ -3,9 +3,23 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, saveTelegramDocument, quotaText, historyPair, localFileParts, telegramFileBody } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, saveTelegramDocument, quotaText, historyPair, localFileParts, telegramFileBody, telegram as telegramRequest } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
+// Long /full imports can exceed Telegram's rate: retry only explicit 429 rejection.
+const originalFetch = globalThis.fetch;
+try {
+  let attempts = 0;
+  globalThis.fetch = async () => new Response(JSON.stringify(++attempts === 1 ?
+    { ok: false, error_code: 429, description: 'Too many requests', parameters: { retry_after: 0.001 } } :
+    { ok: true, result: { message_id: 123 } }));
+  assert.deepEqual(await telegramRequest('fake', 'sendMessage', { text: 'history' }), { message_id: 123 });
+  assert.equal(attempts, 2);
+  attempts = 0;
+  globalThis.fetch = async () => { attempts++; throw new Error('uncertain network failure'); };
+  await assert.rejects(telegramRequest('fake', 'sendMessage', { text: 'history' }), /uncertain network failure/);
+  assert.equal(attempts, 1, 'never retry an uncertain delivery');
+} finally { globalThis.fetch = originalFetch; }
 const msg = { chat: { id: owner, type: 'private' }, from: { id: owner }, text: 'sửa đoạn này' };
 assert(await authorized(msg, owner));
 assert(!await authorized({ ...msg, from: { id: 99 } }, owner));
@@ -312,6 +326,76 @@ liveRestart.creatingChat = false;
 await liveRestart.scanDesktop();
 assert(liveRestart.state.topics.CREATING);
 assert(liveMessages.some(m => m.args.text?.includes('CREATION_DONE')));
+
+// /full replaces only the current mapped topic after every history message is copied.
+const fullMessage = { ...msg, text: '/full@our_bot', chat: { id: -1001234, type: 'supergroup' }, message_thread_id: 101 };
+const fullState = () => ({ topicMode: true, threads: { A: t }, topics: { A: 101 }, enabled: { A: true },
+  routes: {}, seen: {}, delivered: { A: ['old-delivery'] }, newChats: { '-1001234:101': { projectId: 'P', title: null } } });
+const fullTurns = Array.from({ length: 25 }, (_, i) => desktopTurn('full-' + (24 - i), 'Full answer ' + (24 - i)));
+const fullActions = [];
+const fullBridge = new Bridge({ ownerId: owner, chatId: -1001234, botUsername: 'our_bot' }, fullState(),
+  async () => assert.fail('/full must not start a model or create a Codex chat'), async (method, args) => {
+    fullActions.push({ method, args });
+    if (method === 'getMe') return { id: 777 };
+    if (method === 'getChatMember') return { can_delete_messages: true };
+    if (method === 'createForumTopic') return { message_thread_id: 202 };
+    if (method === 'deleteForumTopic') {
+      assert.equal(fullActions.filter(a => a.method === 'sendMessage' && a.args.text?.startsWith('Bạn:')).length, 25);
+      assert.equal(fullBridge.state.topicReplacements.A.copied, true);
+      assert.equal(args.message_thread_id, 101, 'delete the old topic, not the replacement');
+      return true;
+    }
+    return { message_id: fullActions.length };
+  }, () => {});
+fullBridge.fullHistory = async () => ({ turns: fullTurns });
+await fullBridge.handle({ message: fullMessage });
+await fullBridge.syncing.get('A');
+assert.equal(fullBridge.state.topics.A, 202);
+assert.equal(fullBridge.state.pending, undefined);
+assert.equal(fullBridge.syncing.has('A'), false);
+assert(fullBridge.state.historyImported.A);
+assert(fullActions.some(a => a.args.text?.includes('Full answer 0') && a.args.message_thread_id === 202));
+assert(fullActions.some(a => a.args.text?.includes('Full answer 24') && a.args.message_thread_id === 202));
+const fullPrompts = fullActions.filter(a => a.method === 'sendMessage' && a.args.text?.startsWith('Bạn:'));
+assert(fullPrompts[0].args.text.includes('desktop full-0'));
+assert(fullPrompts.at(-1).args.text.includes('desktop full-24'));
+const noTopicMutations = fullActions.length;
+await fullBridge.handle({ message: { ...fullMessage, message_thread_id: 1 } });
+await fullBridge.handle({ message: { ...fullMessage, message_thread_id: 999 } });
+await fullBridge.handle({ message: { ...msg, text: '/full' } });
+assert(!fullActions.slice(noTopicMutations).some(a => ['createForumTopic', 'deleteForumTopic'].includes(a.method)));
+
+for (const failure of ['copy', 'delete', 'rights']) {
+  const actions = [], state = fullState();
+  const failedFull = new Bridge({ ownerId: owner, chatId: -1001234 }, state,
+    async () => assert.fail('no model dispatch'), async (method, args) => {
+      actions.push(method);
+      if (method === 'getMe') return { id: 777 };
+      if (method === 'getChatMember') return { can_delete_messages: failure !== 'rights' };
+      if (method === 'createForumTopic') return { message_thread_id: 303 };
+      if (method === 'sendMessage' && args.message_thread_id === 303 && args.text.startsWith('Bạn:') && failure === 'copy') throw new Error('Copy failed');
+      if (method === 'deleteForumTopic') throw new Error('Uncertain delete');
+      return { message_id: actions.length };
+    }, () => {});
+  failedFull.fullHistory = async () => ({ turns: fullTurns });
+  await failedFull.handle({ message: { ...fullMessage, text: '/full' } });
+  await failedFull.syncing.get('A');
+  assert.equal(actions.filter(a => a === 'deleteForumTopic').length, failure === 'delete' ? 1 : 0);
+  assert.equal(state.topics.A, failure === 'delete' ? 303 : 101);
+  assert.equal(state.pending, undefined);
+  if (failure !== 'delete') assert.deepEqual(state.delivered.A, ['old-delivery'], 'failed copy preserves old delivery state');
+}
+let releaseFull;
+const blockedFull = new Promise(resolve => { releaseFull = resolve; });
+const concurrentFull = new Bridge({ ownerId: owner, chatId: -1001234 }, fullState(),
+  async tool => { assert.equal(tool, 'get_usage_limits'); return {}; },
+  async method => method === 'getMe' ? { id: 777 } : method === 'getChatMember' ? { can_delete_messages: true } :
+    method === 'createForumTopic' ? { message_thread_id: 505 } : method === 'deleteForumTopic' ? true : { message_id: 1 }, () => {});
+concurrentFull.fullHistory = async () => { await blockedFull; return { turns: [] }; };
+await concurrentFull.handle({ message: { ...fullMessage, text: '/full' } });
+assert(concurrentFull.syncing.has('A'), 'full import runs in background');
+await concurrentFull.handle({ message: { ...msg, text: '/quota' } }); // Another context must remain responsive.
+releaseFull(); await concurrentFull.syncing.get('A');
 
 // XML/code is escaped by Codex before read_thread returns the delegated prompt.
 const xmlPrompt = '<entry title="test">Tom & Jerry &lt;literal&gt;</entry>';

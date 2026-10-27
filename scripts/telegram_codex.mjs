@@ -73,10 +73,25 @@ export async function appCall(callerThreadId, tool, args) {
   try { return JSON.parse(text); } catch { return { message: text }; }
 }
 
-export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')) {
+export async function readLocalTurnPage(threadId, { cursor, all = false } = {}, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), selectedFile) {
   if (!/^[a-f0-9-]{36}$/i.test(threadId)) throw new Error('ID chat local không hợp lệ.');
   const root = path.join(codexHome, 'sessions');
-  const files = fs.readdirSync(root, { recursive: true }).filter(name => name.endsWith('-' + threadId + '.jsonl'));
+  const files = selectedFile ? [selectedFile] : fs.readdirSync(root, { recursive: true }).filter(name =>
+    name.endsWith('-' + threadId + '.jsonl') || (all && path.basename(name).includes('-' + threadId + '_'))).sort();
+  if (all && files.length > 1) {
+    const merged = new Map();
+    for (const file of files) {
+      const page = await readLocalTurnPage(threadId, { all: true }, codexHome, file);
+      for (const turn of page.turns.reverse()) {
+        const prior = merged.get(turn.id);
+        const items = [...(prior?.items || []), ...turn.items].filter(i => i.type !== 'localReadBoundary');
+        turn.items = [...new Map(items.map(i => [i.id, i])).values()];
+        if (turn.status === 'inProgress') turn.items.push({ type: 'localReadBoundary' });
+        merged.set(turn.id, turn);
+      }
+    }
+    return { thread: { id: threadId }, turns: [...merged.values()].reverse(), page: { nextCursor: null } };
+  }
   if (files.length !== 1) throw new Error('Không xác định được đúng một file lịch sử local của chat.');
   const anchor = cursor ? JSON.parse(cursor) : null;
   if (anchor && (anchor.requestedThreadId !== threadId || anchor.scope?.kind !== 'turns' ||
@@ -84,6 +99,7 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
     throw new Error('Mốc lịch sử không hỗ trợ đọc local; chưa đồng bộ.');
   }
   let ordinal = -1, bound = false, anchorFound = !anchor, turn, hasPrevious = false;
+  const previousTurns = [];
   const input = fs.createReadStream(path.join(root, files[0]));
   const lines = createInterface({ input, crlfDelay: Infinity });
   try {
@@ -95,6 +111,8 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
       if (!isAnchor && !/"type"\s*:\s*"(?:session_meta|event_msg)"/.test(prefix)) continue;
       if (!isAnchor && /"type"\s*:\s*"item_(?:completed|started)"/.test(prefix) &&
           !/"type"\s*:\s*"(?:UserMessage|AgentMessage|FunctionCallOutput)"/.test(prefix)) continue;
+      if (!isAnchor && /"type"\s*:\s*"FunctionCallOutput"/.test(prefix) &&
+          !/"namespace"\s*:\s*"codex_app"/.test(prefix)) continue;
       let row;
       try { row = JSON.parse(line); }
       catch { if (!line.endsWith('}')) continue; throw new Error('Bản lưu lịch sử local có dữ liệu JSON không hợp lệ.'); }
@@ -111,6 +129,7 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
       if (p.type === 'task_started') {
         if (anchor && (ordinal > anchor.rolloutOrdinal || (isAnchor && !anchor.includeAnchor))) break;
         hasPrevious = !!turn;
+        if (all && turn) previousTurns.push(turn);
         turn = { id: p.turn_id, status: 'inProgress', items: [], ordinal };
         continue;
       }
@@ -136,14 +155,15 @@ export async function readLocalTurnPage(threadId, { cursor } = {}, codexHome = p
     }
   } finally { lines.close(); input.destroy(); }
   if (!bound || !anchorFound) throw new Error('Chưa xác minh được file/mốc lịch sử local.');
-  const nextCursor = turn && hasPrevious ? JSON.stringify({ requestedThreadId: threadId,
+  const nextCursor = !all && turn && hasPrevious ? JSON.stringify({ requestedThreadId: threadId,
     rolloutOrdinal: turn.ordinal, includeAnchor: false, scope: { kind: 'turns' } }) : null;
-  if (turn) {
-    delete turn.ordinal;
+  const projected = [...previousTurns, ...(turn ? [turn] : [])];
+  for (const value of projected) {
+    delete value.ordinal;
     // These items are completed: do not suppress the last message as a streaming item.
-    if (turn.status === 'inProgress') turn.items.push({ type: 'localReadBoundary' });
+    if (value.status === 'inProgress') value.items.push({ type: 'localReadBoundary' });
   }
-  return { thread: { id: threadId }, turns: turn ? [turn] : [], page: { nextCursor } };
+  return { thread: { id: threadId }, turns: projected.reverse(), page: { nextCursor } };
 }
 
 export async function readThread(call, args, codexHome) {
@@ -538,6 +558,7 @@ export class Bridge {
     this.interrupt = interrupt;
     this.readProjectState = readProjectState;
     this.readQuestion = pendingQuestion;
+    this.fullHistory = id => readLocalTurnPage(id, { all: true });
     this.prepareQuestion = (id, questions, answer) => prepareQuestionReply(id, questions, answer, this.call);
     this.readErrors = new Map();
     this.creatingTopics = new Map();
@@ -556,6 +577,7 @@ export class Bridge {
     this.state.awaitingQuestions ||= {};
     this.state.historyImported ||= {};
     this.state.controlActions ||= {};
+    this.state.topicReplacements ||= {};
     this.state.approvalNotices ||= {};
     this.creatingChat = false;
   }
@@ -654,6 +676,47 @@ export class Bridge {
     }
     this.state.historyImported[threadId] = true;
     this.persist();
+  }
+
+  async replaceTopic(id, oldTopic) {
+    const operation = { kind: 'full', threadId: id, oldTopic,
+      oldDelivered: this.state.delivered[id] || [] };
+    this.state.topicReplacements[id] = operation;
+    this.persist();
+    try {
+      const me = await this.telegram('getMe', {});
+      const member = await this.telegram('getChatMember', { chat_id: this.config.chatId, user_id: me.id });
+      if (!member.can_delete_messages) throw new Error('Bot cần quyền Delete messages để dùng /full.');
+      const { turns } = await this.fullHistory(id);
+      const topic = await this.telegram('createForumTopic', { chat_id: this.config.chatId,
+        name: Array.from(this.state.threads[id].title).slice(0, 128).join('') });
+      operation.newTopic = topic.message_thread_id;
+      this.state.topics[id] = operation.newTopic;
+      this.state.delivered[id] = [];
+      this.persist();
+      for (const event of conversationEvents(turns)) {
+        await this.deliver(id, { ...event, origin: 'desktop' }, !!event.activeQuestion);
+      }
+      await this.send('Đã chép toàn bộ lịch sử tin nhắn. Topic này nối với cùng chat Codex; đang thay topic cũ.', id);
+      this.state.historyImported[id] = true;
+      operation.copied = true;
+      this.persist();
+      const deleted = await this.telegram('deleteForumTopic', { chat_id: this.config.chatId, message_thread_id: oldTopic });
+      if (!deleted) throw new Error('Telegram chưa xác nhận xóa topic cũ.');
+    } catch (error) {
+      if (!operation.copied) {
+        this.state.topics[id] = oldTopic;
+        this.state.delivered[id] = operation.oldDelivered;
+        this.persist();
+        await this.send('Chưa chép đủ lịch sử; đã giữ topic cũ. ' + error.message +
+          (operation.newTopic ? '\nTopic mới đang chép dở chưa được liên kết.' : ''), id);
+      } else {
+        await this.send('Lịch sử đã chép đủ vào topic này, nhưng chưa xác nhận xóa topic cũ. Không tự xóa lại. ' + error.message, id);
+      }
+    } finally {
+      delete this.state.topicReplacements[id];
+      this.persist();
+    }
   }
 
   async pullUpdate(threadId) {
@@ -897,6 +960,13 @@ export class Bridge {
       args => this.telegram('getChatMember', args))) return;
     const controlReply = text => this.send(text, null, { chat_id: message.chat.id,
       ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }) });
+    const replacing = Object.values(this.state.topicReplacements).find(op =>
+      message.chat.id === this.config.chatId && [op.oldTopic, op.newTopic].includes(message.message_thread_id));
+    if (replacing) {
+      if (update.message && (this.state.ignoredPrompts[message.chat.id + ':' + message.message_id] ||
+        this.state.historyPending[message.chat.id + ':' + message.message_thread_id] === message.text)) return;
+      return controlReply('Topic này đang chép toàn bộ lịch sử. Chờ hoàn tất rồi nhắn tiếp; các chat khác vẫn dùng được.');
+    }
     if (update.message && message.message_thread_id != null) {
       const threadId = destination(message, this.state);
       if (this.creatingTopics.has(threadId)) await this.creatingTopics.get(threadId);
@@ -978,6 +1048,20 @@ export class Bridge {
       try { return await this.modelMenu(id, command === '/effort'); }
       catch (error) { return controlReply('Chưa đọc được model: ' + error.message); }
     }
+    if (command === '/full') {
+      const id = destination(message, this.state);
+      if (!this.state.topicMode || message.chat.id !== this.config.chatId ||
+        !Number.isSafeInteger(message.message_thread_id) || message.message_thread_id <= 1 || !this.state.threads[id]) {
+        return controlReply('Gửi /full trong topic đã nối với một chat Codex; không dùng trong General hoặc private chat.');
+      }
+      await controlReply('Đang chép toàn bộ lịch sử sang topic mới. Chỉ xóa topic này sau khi chép xong.');
+      const work = this.replaceTopic(id, message.message_thread_id)
+        .catch(error => controlReply('Chưa thay topic; topic cũ được giữ nguyên. ' + error.message))
+        .finally(() => this.syncing.delete(id));
+      this.syncing.set(id, work);
+      void work.catch(error => console.error('/full:', error.message));
+      return;
+    }
     if (command === '/cancel') {
       if (this.state.newChats[menuContext(message)]) {
         delete this.state.newChats[menuContext(message)];
@@ -1016,7 +1100,7 @@ export class Bridge {
       });
     }
     if (command === '/help') {
-      return controlReply('/start — bật Codex\n/restart — tắt rồi mở lại Codex (ngắt các lượt đang chạy)\n/model — đổi model cho chat đang chọn\n/effort — đổi mức suy nghĩ cho model hiện tại\n/projects — chọn project, mở chat gần đây hoặc New chat\nNew chat → đặt tên → gửi prompt đầu tiên (có thể kèm ảnh/file).\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer. Chat, prompt và phản hồi mới trên desktop tự đồng bộ; không cần /update.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: chọn bằng nút khi có; yêu cầu không hỗ trợ thì xử lý trong App.');
+      return controlReply('/start — bật Codex\n/restart — tắt rồi mở lại Codex (ngắt các lượt đang chạy)\n/model — đổi model cho chat đang chọn\n/effort — đổi mức suy nghĩ cho model hiện tại\n/projects — chọn project, mở chat gần đây hoặc New chat\nNew chat → đặt tên → gửi prompt đầu tiên (có thể kèm ảnh/file).\n/chats — chọn chat có sẵn\nNhắn trong topic để gửi prompt hoặc steer. Chat, prompt và phản hồi mới trên desktop tự đồng bộ; không cần /update.\n/update — lấy tin desktop mới sau prompt Telegram gần nhất\n/full — thay topic hiện tại, chép toàn bộ lịch sử chat Codex\n/cancel — dừng lượt đang chạy, hoặc hủy bước New chat\n/status — trạng thái chat\n/quota — hạn mức Codex và thời điểm reset\nChờ cấp quyền: chọn bằng nút khi có; yêu cầu không hỗ trợ thì xử lý trong App.');
     }
     if (command === '/chats') {
       const threads = await this.chats();
@@ -1117,6 +1201,7 @@ export class Bridge {
     for (const id of Object.keys(this.state.enabled).filter(id => this.state.enabled[id])) {
       const thread = this.state.threads[id];
       if (!thread) continue;
+      if (this.syncing.has(id)) continue;
       // Keep the copied first prompt ahead of responses, including fast turns.
       if (this.state.pending?.kind === 'create' && this.state.pending.threadId === id) continue;
       try {
@@ -1140,6 +1225,7 @@ export class Bridge {
           turns.push(...(result.turns || []));
           cursor = result.page?.nextCursor;
         } while (prior && !baseline && cursor && !turns.some(t => t.id === prior.turnId));
+        if (this.syncing.has(id)) continue;
         const flags = status?.activeFlags || [];
         const waiting = flags.filter(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag));
         if (waiting.length) {
@@ -1155,12 +1241,14 @@ export class Bridge {
         this.state.attention[id] = attention;
         const all = this.sourcedEvents(id, turns);
         for (const event of all) {
+          if (this.syncing.has(id)) break;
           // Questions need attention even for desktop prompts; do not backfill old completed questions.
           const newQuestion = event.question && (event.activeQuestion || (prior && !prior.keys.includes(event.key)));
           if (realtime ? !baseline && !prior?.keys?.includes(event.key) : event.origin === 'telegram' || newQuestion) {
             await this.deliver(id, event, !!newQuestion);
           }
         }
+        if (this.syncing.has(id)) continue;
         this.state.seen[id] = {
           turnId: turns[0]?.id,
           keys: all.map(event => event.key),
@@ -1182,7 +1270,7 @@ export class Bridge {
   }
 }
 
-async function telegram(token, method, body) {
+export async function telegram(token, method, body) {
   const upload = method === 'sendDocument' && typeof body.document === 'string' && /^[A-Za-z]:[\\/]/.test(body.document);
   const response = await fetch('https://api.telegram.org/bot' + token + '/' + method, {
     method: 'POST', ...(upload ? { body: await telegramFileBody(body) } : {
@@ -1192,7 +1280,11 @@ async function telegram(token, method, body) {
   });
   const data = await response.json();
   if (!data.ok) {
-    if (data.parameters?.retry_after) await sleep(data.parameters.retry_after * 1000);
+    if (data.error_code === 429 && data.parameters?.retry_after) {
+      // Telegram explicitly rejected this request; retrying after its wait is safe.
+      await sleep(data.parameters.retry_after * 1000);
+      return telegram(token, method, body);
+    }
     throw new Error('Telegram ' + data.error_code + ': ' + data.description);
   }
   return data.result;
@@ -1245,6 +1337,7 @@ async function main() {
     { command: 'projects', description: 'Chọn project, mở hoặc tạo chat' },
     { command: 'chats', description: 'Chọn chat có sẵn' },
     { command: 'update', description: 'Lấy tin mới từ prompt trên desktop' },
+    { command: 'full', description: 'Thay topic hiện tại bằng toàn bộ lịch sử Codex' },
     { command: 'cancel', description: 'Dừng lượt đang chạy hoặc hủy New chat' },
     { command: 'status', description: 'Trạng thái chat trong topic' },
     { command: 'quota', description: 'Hạn mức Codex và giờ reset' },
@@ -1287,6 +1380,17 @@ async function main() {
     }
   }
   const bridge = new Bridge(config, state, call, tg, () => saveJson(stateFile, state), undefined, personal?.send);
+  for (const operation of Object.values(state.topicReplacements)) {
+    if (!operation.copied) {
+      state.topics[operation.threadId] = operation.oldTopic;
+      state.delivered[operation.threadId] = operation.oldDelivered;
+    }
+    await bridge.send(operation.copied ?
+      'Lịch sử đã chép đủ; trạng thái xóa topic cũ chưa xác định. Bot không tự xóa lại.' :
+      'Bot dừng khi chép lịch sử. Topic cũ được giữ nguyên; topic mới có thể đang chép dở.', operation.threadId);
+    delete state.topicReplacements[operation.threadId];
+    bridge.persist();
+  }
   if (state.pending) {
     await bridge.send('Bot đã dừng khi đang gửi prompt hoặc tạo chat. Kết quả chưa xác định; kiểm tra App trước khi thử lại.', state.pending.threadId);
     delete state.pending;

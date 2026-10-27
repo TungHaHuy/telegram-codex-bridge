@@ -3,6 +3,20 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 27/10/2026 — Thay topic với toàn bộ lịch sử bằng /full
+
+- Gửi `/full` trong topic đã liên kết: tạo topic mới cùng chat Codex, chép toàn
+  bộ prompt/phản hồi/progress đã chốt theo thứ tự rồi mới xóa topic cũ. Không
+  tạo chat Codex mới, không chạy lại prompt, không giới hạn 20 cặp/20.000 ký tự.
+- Đọc bản lưu local một lượt, gồm cả các file lịch sử nối tiếp; không gửi log
+  công cụ/reasoning. Ảnh native inline vẫn hiện nhãn `[Ảnh]` theo cách nhập lịch sử.
+- Bot cần quyền Delete messages. General/private/topic chưa liên kết bị từ chối.
+  Chép lỗi giữ topic cũ; lỗi xóa chưa xác định giữ bản mới đầy đủ, không tự xóa lại.
+- Tác vụ chạy nền theo từng chat, chat khác vẫn nhận lệnh. Sau restart, tác vụ
+  chưa chép xong quay về topic cũ; tác vụ chép xong không tự lặp bước xóa.
+- Chờ và thử lại khi Telegram trả rõ lỗi 429 kèm retry_after; lỗi mạng không rõ
+  kết quả không tự gửi lại. Kiểm thử thất bại giữa chừng, thứ tự và topic tạm thật.
+
 ## 27/10/2026 — Tự đồng bộ hoạt động desktop
 
 - Tự phát hiện chat local mới, tạo topic tương ứng và chuyển prompt/phản hồi

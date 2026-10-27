@@ -38,6 +38,14 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
   kể cả prompt đến từ desktop và lượt chat vẫn đang chạy; không cần `/update`.
   Phản hồi desktop thông thường cũng tự đồng bộ sau mốc khởi tạo.
 - `/cancel` dừng đúng lượt đang chạy trong topic hiện tại.
+- `/full` tạo topic mới nối cùng chat Codex, chép toàn bộ lịch sử chữ rồi mới
+  xóa topic hiện tại. Không tạo chat Codex hoặc chạy lại prompt. Bot cần quyền
+  **Delete messages** để [xóa topic](https://core.telegram.org/bots/api#deleteforumtopic).
+  Không dùng trong General/private. Chép lỗi thì giữ topic cũ; chat khác vẫn dùng
+  được trong lúc chạy. Lịch sử dài có thể mất thời gian do giới hạn gửi Telegram.
+  Gồm prompt, response, progress đã chốt và lỗi; không gửi reasoning/log công cụ.
+  Ảnh native inline chỉ có nhãn `[Ảnh]`, không tái dựng byte ảnh; file local trong
+  phản hồi vẫn gửi theo cơ chế đính kèm hiện có.
 - Gửi ảnh Photo hoặc tài liệu dưới dạng Document, có thể kèm caption làm yêu cầu.
 - `/quota` xem hạn mức tài khoản và thời điểm reset theo giờ Việt Nam.
 - `/start` bật Codex; `/restart` tắt rồi mở lại đúng gói Codex trên máy (có thể
@@ -206,6 +214,7 @@ bot, xen kẽ 5 response từ bot; lịch sử Codex không xuất hiện lượ
 | `/status` | Xem trạng thái chat của topic hoặc chat đang chọn |
 | `/quota` | Xem hạn mức tài khoản, giờ reset và credit khi App cung cấp |
 | `/update` | Lấy phần desktop chưa gửi sau prompt Telegram gần nhất của chat |
+| `/full` | Thay topic hiện tại bằng topic mới có toàn bộ lịch sử chữ của cùng chat |
 | `/cancel` | Dừng lượt đang chạy trong topic; nếu đang New chat thì hủy bước tạo |
 | `/help` | Hướng dẫn ngắn |
 
