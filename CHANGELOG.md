@@ -16,6 +16,8 @@ không tự đặt số phiên bản. Phần kiểm thử phân biệt kết qu�
   chưa chép xong quay về topic cũ; tác vụ chép xong không tự lặp bước xóa.
 - Chờ và thử lại khi Telegram trả rõ lỗi 429 kèm retry_after; lỗi mạng không rõ
   kết quả không tự gửi lại. Kiểm thử thất bại giữa chừng, thứ tự và topic tạm thật.
+- Lưu trạng thái trên Windows chờ ngắn và thử lại tối đa 10 lần khi rename gặp
+  đúng EPERM do file bị khóa; không che các lỗi ghi khác hoặc ghi đè không nguyên tử.
 
 ## 27/10/2026 — Tự đồng bộ hoạt động desktop
 
