@@ -6,9 +6,13 @@ import { approvalChoices, controlCodexApp } from '../scripts/telegram_codex_cont
 const msg = { from: { id: 1 }, chat: { id: -10, type: 'supergroup' }, message_thread_id: 101 };
 const state = { topicMode: true, topics: { A: 101, B: 102 }, enabled: { A: true }, threads: { A: { title: 'A' } }, routes: {}, seen: {} };
 const calls = [], sends = [], lifecycle = [];
+let ackExpires = false;
 const bridge = new Bridge({ ownerId: 1, chatId: -10 }, state, async (tool, args) => {
   calls.push({ tool, args }); return { threads: [], pinnedThreads: [] };
-}, async (method, args) => { sends.push({ method, args }); return { message_id: sends.length }; }, () => {});
+}, async (method, args) => {
+  if (method === 'answerCallbackQuery' && ackExpires) throw new Error('Telegram 400: Bad Request: query is too old and response timeout expired or query ID is invalid');
+  sends.push({ method, args }); return { message_id: sends.length };
+}, () => {});
 bridge.appControl = async action => { lifecycle.push(action); };
 const input = text => ({ message: { ...msg, text } });
 await bridge.handle({ message: { ...msg, from: { id: 99 }, text: '/restart' } });
@@ -89,6 +93,7 @@ const approvalButton = sends.at(-1).args.reply_markup.inline_keyboard[0][0];
 assert(sends.some(s => s.args.text?.includes('Allow Chrome access to example.com?')));
 const noticeCount = sends.length;
 await bridge.approvalMenu('A'); assert.equal(sends.length, noticeCount, 'no duplicate pending permission menus');
+ackExpires = true; // UI ack expiry must retain request/topic/fingerprint and one-shot validation.
 await bridge.handle(callback(approvalButton.callback_data));
 assert.equal(native.at(-1).method, 'thread-follower-submit-mcp-server-elicitation-response');
 assert.equal(native.at(-1).params.requestId, 7);

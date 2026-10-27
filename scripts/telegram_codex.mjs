@@ -909,8 +909,13 @@ export class Bridge {
     }
     if (update.callback_query) {
       const id = update.callback_query.data || '';
+      // Stop the button spinner before any slow Codex read. Telegram may have
+      // expired this UI acknowledgement while an earlier operation was running.
+      try { await this.telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id }); }
+      catch (error) {
+        if (!/^Telegram 400: Bad Request: (?:query is too old and response timeout expired or query ID is invalid|QUERY_ID_INVALID)$/i.test(error.message)) throw error;
+      }
       if (id.startsWith('control:')) {
-        await this.telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id });
         const [, key, choice] = id.split(':');
         try { return await this.handleControl(key, choice, message); }
         catch (error) { return controlReply('Chưa thực hiện được: ' + error.message); }
@@ -921,7 +926,6 @@ export class Bridge {
         const projects = localProjects(await this.call('list_projects', {}));
         this.state.projects = Object.fromEntries(projects.map(p => [p.projectId, p]));
         this.persist();
-        await this.telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id });
         const project = this.state.projects[projectId];
         if (!project) return controlReply('Project không còn khả dụng. Gửi /projects để chọn lại.');
         if (action === 'project') return this.projectMenu(projectId, message);
@@ -934,7 +938,6 @@ export class Bridge {
       this.state.selected = id;
       this.state.enabled[id] = true;
       this.persist();
-      await this.telegram('answerCallbackQuery', { callback_query_id: update.callback_query.id });
       await this.send(this.state.topicMode ?
         'Topic này nối với chat Codex cùng tên. Nhắn ngay trong topic để gửi prompt hoặc steer.' :
         'Đã chọn. Nhắn bình thường để gửi vào chat này; Reply để chọn theo tin.', id);

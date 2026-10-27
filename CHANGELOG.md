@@ -12,6 +12,9 @@ không tự đặt số phiên bản. Phần kiểm thử phân biệt kết qu�
 - Kiểm tra với lượt lỗi thật: phục hồi prompt và câu trả lời cuối từ rollout
   hơn 225 MB thành khoảng 12 KB tin nhắn; giữ ID/nội dung trùng App ở lượt đọc được.
 - Test bao phủ scan, /update, nhập lịch sử và chống gửi trùng khi fallback.
+- Nút menu được xác nhận trước khi đọc Codex. Lỗi Telegram 400 riêng về query
+  hết hạn không hủy lựa chọn hoặc đổ thông báo lỗi liên tiếp; các lỗi API khác
+  vẫn được báo. Kiểm tra quyền/topic/nội dung và chống quyết định lặp giữ nguyên.
 
 ## 26/10/2026 — Sửa lượt lịch sử quá lớn và đăng nhập bằng mã
 

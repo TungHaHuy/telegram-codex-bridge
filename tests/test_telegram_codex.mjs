@@ -669,6 +669,33 @@ assert.equal(projectButtons[0][0].callback_data, 'newchat:P');
 assert.deepEqual(projectButtons.slice(1).map(row => row[0].callback_data),
   Array.from({ length: 20 }, (_, i) => 'r' + (22 - i)));
 
+// Expired button-spinner acknowledgements do not abort the actual selection.
+const callbackOrder = [], callbackReplies = [];
+let ackError = 'Telegram 400: Bad Request: query is too old and response timeout expired or query ID is invalid';
+const expiredButtons = new Bridge({ ownerId: owner }, {
+  threads: { A: t }, routes: {}, seen: {}, historyImported: { A: true },
+}, async tool => {
+  callbackOrder.push(tool);
+  if (tool === 'list_projects') return { projects: [project] };
+  assert.equal(tool, 'list_threads'); return { threads: recent, pinnedThreads: [] };
+}, async (method, args) => {
+  callbackOrder.push(method);
+  if (method === 'answerCallbackQuery' && ackError) throw new Error(ackError);
+  callbackReplies.push(args); return { message_id: callbackReplies.length };
+}, () => {});
+await expiredButtons.handle(click('project:P'));
+assert.equal(callbackOrder[0], 'answerCallbackQuery', 'acknowledge before querying Codex');
+assert(callbackReplies.at(-1).text.startsWith('Project:'));
+await expiredButtons.handle(click('newchat:P'));
+assert.equal(expiredButtons.state.newChats[owner + ':0'].projectId, 'P');
+await expiredButtons.handle(click('A'));
+assert.equal(expiredButtons.state.selected, 'A');
+assert(callbackReplies.at(-1).text.startsWith('[Chat A]'));
+const beforeUnrelatedAck = callbackOrder.length;
+ackError = 'Telegram 401: Unauthorized';
+await assert.rejects(expiredButtons.handle(click('project:P')), /Unauthorized/);
+assert.deepEqual(callbackOrder.slice(beforeUnrelatedAck), ['answerCallbackQuery'], 'do not hide unrelated API failures');
+
 // New/live chats may have null API project IDs despite explicit saved membership.
 const savedProjects = {
   'local-projects': { P: { id: 'P' }, Q: { id: 'Q' } },
