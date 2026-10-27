@@ -16,7 +16,13 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 export function saveJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file + '.tmp', JSON.stringify(value, null, 2), { mode: 0o600 });
-  fs.renameSync(file + '.tmp', file);
+  for (let attempt = 0; ; attempt++) {
+    try { fs.renameSync(file + '.tmp', file); break; }
+    catch (error) {
+      if (process.platform !== 'win32' || error.code !== 'EPERM' || attempt >= 9) throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
 }
 
 // Same local protocol as the installed codex-app-tools plugin. No public listener.

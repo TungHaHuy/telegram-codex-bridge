@@ -3,9 +3,29 @@ import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, saveTelegramDocument, quotaText, historyPair, localFileParts, telegramFileBody, telegram as telegramRequest } from '../scripts/telegram_codex.mjs';
+import { Bridge, authorized, chunks, destination, events, pipeRequest, desktopRequest, pendingQuestion, prepareQuestionReply, localThreads, localProjects, readCodexProjectState, telegramImage, saveTelegramImage, saveTelegramDocument, quotaText, historyPair, localFileParts, telegramFileBody, telegram as telegramRequest, saveJson } from '../scripts/telegram_codex.mjs';
 
 const owner = 1234;
+const saveDir = fs.mkdtempSync(path.join(os.tmpdir(), 'telegram-save-lock-'));
+const originalRename = fs.renameSync;
+try {
+  let renames = 0;
+  fs.renameSync = (...args) => {
+    if (process.platform === 'win32' && ++renames === 1) throw Object.assign(new Error('temporary Windows sharing violation'), { code: 'EPERM' });
+    return originalRename(...args);
+  };
+  saveJson(path.join(saveDir, 'state.json'), { intact: true });
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(saveDir, 'state.json'))), { intact: true });
+  if (process.platform === 'win32') assert.equal(renames, 2);
+  renames = 0;
+  fs.renameSync = () => { renames++; throw Object.assign(new Error('other write error'), { code: 'EACCES' }); };
+  assert.throws(() => saveJson(path.join(saveDir, 'other.json'), {}), /other write error/);
+  assert.equal(renames, 1, 'unrelated write errors must not be retried or hidden');
+} finally {
+  fs.renameSync = originalRename;
+  assert(path.resolve(saveDir).startsWith(path.resolve(os.tmpdir()) + path.sep));
+  fs.rmSync(saveDir, { recursive: true });
+}
 // Long /full imports can exceed Telegram's rate: retry only explicit 429 rejection.
 const originalFetch = globalThis.fetch;
 try {
