@@ -4,7 +4,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline/promises';
 import { Writable } from 'node:stream';
-import { saveJson } from './telegram_codex.mjs';
+import { saveJson, checkedTelegramFile } from './telegram_codex.mjs';
 
 const LOCAL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.telegram-codex');
 const USER_FILE = path.join(LOCAL, 'user-session.json');
@@ -35,13 +35,41 @@ export async function openPersonal(ownerId, groupId) {
     }
     if (!peer) throw new Error('Tài khoản cá nhân chưa ở trong nhóm Telegram đã cấu hình.');
     return {
-      send: (text, topicId) => {
+      send: async (text, topicId, receipt) => {
         if (!Number.isSafeInteger(topicId) || topicId <= 0) throw new Error('Topic không hợp lệ.');
+        if (receipt?.randomId) {
+          const { Api } = dependency('teleproto'), bigInt = dependency('big-integer');
+          const request = new Api.messages.SendMessage({ peer, message: text, noWebpage: true, entities: [],
+            replyTo: new Api.InputReplyToMessage({ replyToMsgId: topicId }), randomId: bigInt(receipt.randomId) });
+          const result = await client.invoke(request);
+          const sent = result instanceof Api.UpdateShortSentMessage ? result : client._getResponseMessage(request, result, peer);
+          if (!sent?.id) throw new Error('Telegram chưa xác nhận ID tin lịch sử; giữ hàng chờ.');
+          return sent;
+        }
         return client.sendMessage(peer, { message: text, replyTo: topicId, parseMode: undefined, formattingEntities: [], linkPreview: false });
       },
       disconnect: () => client.disconnect(),
     };
   } catch (error) { await client.disconnect(); throw error; }
+}
+
+// Reuse the installed MTProto client for files exceeding the hosted Bot API limit.
+// Authenticate a separate bot session; never send assistant files as the owner.
+export async function sendBotFile(token, body) {
+  const { file } = checkedTelegramFile(body.document);
+  const { apiId, apiHash } = JSON.parse(fs.readFileSync(USER_FILE, 'utf8'));
+  const client = clientFor({ apiId, apiHash, session: '' });
+  try {
+    await client.connect();
+    await client.signInBot({ apiId, apiHash }, { botAuthToken: token });
+    const me = await client.getMe();
+    if (!me.bot || String(me.id) !== token.split(':')[0]) throw new Error('Phiên upload không khớp bot.');
+    const sent = await client.sendFile(body.chat_id, {
+      file, caption: body.caption || '', replyTo: body.message_thread_id,
+      forceDocument: true, parseMode: undefined, formattingEntities: [], workers: 4,
+    });
+    return { message_id: sent.id };
+  } finally { await client.disconnect(); }
 }
 
 async function login() {

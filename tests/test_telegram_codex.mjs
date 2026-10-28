@@ -118,7 +118,7 @@ const bridge = new Bridge({ ownerId: owner }, state, async (tool, args) => {
     return { threadId: args.threadId };
   }
 }, async (method, args) => { sent.push(args); return { message_id: 100 + sent.length }; },
-() => { if (state.pending) persistedPending = true; });
+() => { if (Object.keys(state.pendingOps).length) persistedPending = true; });
 await bridge.handle({ update_id: 1, message: { ...msg, from: { id: 99 } } });
 assert.equal(calls.length, 0);
 await bridge.handle({ update_id: 2, message: { ...msg, reply_to_message: { message_id: 7 } } });
@@ -129,13 +129,29 @@ fail = true;
 await bridge.handle({ update_id: 4, message: msg });
 assert.equal(calls.length, 2, 'uncertain dispatch must not retry');
 assert(sent.at(-1).text.includes('không tự gửi lại'));
-assert.equal(state.pending, undefined);
+assert.equal(Object.keys(state.pendingOps).length, 0);
+
+const ackState = { selected: 'A', threads: { A: { title: 'A' } }, routes: {}, seen: {} };
+const ackMessages = [];let ackDispatches = 0;
+const ackBridge = new Bridge({ ownerId: owner }, ackState, async () => {
+  ackDispatches++;return { message: 'Codex App đã nhận prompt.' };
+}, async (method, args) => {
+  ackMessages.push(args.text);throw new Error('Telegram acknowledgement timeout');
+}, () => {});
+await assert.rejects(ackBridge.handle({ message: { ...msg, reply_to_message: undefined } }), /Telegram acknowledgement timeout/);
+assert.equal(ackDispatches, 1);
+assert.equal(ackMessages.length, 1, 'accepted prompts must not get an uncertain-dispatch warning when only their acknowledgement failed');
+assert(ackMessages[0].includes('đã nhận prompt'));
+assert.equal(Object.keys(ackState.pendingOps).length, 0, 'confirmed dispatch is cleared before attempting the Telegram acknowledgement');
 
 const linked = localFileParts('Before [Report](<D:/work/My report (1).pdf:12>) after `D:\\work\\data.csv` and https://example.com/file.pdf');
 assert.equal(linked[1].file, 'D:/work/My report (1).pdf');
 assert.equal(linked[3].file, 'D:\\work\\data.csv');
 assert.equal(localFileParts('See D:/work/test.zip now')[1].file, 'D:/work/test.zip');
 assert.equal(localFileParts('![preview](/D:/work/image.png)')[0].file, 'D:/work/image.png');
+for (const url of ['https://scikit-learn.org/stable/common_pitfalls.html', '[Docs](https://example.com/file.pdf)', 'http://example.com/file.pdf']) {
+  assert.deepEqual(localFileParts(url), [{ text: url }], 'web links must not become Windows file uploads');
+}
 const fileSends = [];
 const fileState = { topicMode: true, enabled: { A: true }, topics: { A: 101 }, threads: { A: { title: 'A' } }, routes: {}, seen: {} };
 const fileBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, fileState, () => assert.fail('sending files must not dispatch prompts'),
@@ -150,12 +166,20 @@ fileBridge.telegram = async (method, args) => {
   if (method === 'sendDocument') throw new Error('upload failed');
   fileSends.push({ method, args }); return { message_id: fileSends.length };
 };
+await assert.rejects(fileBridge.deliver('A', { key: 'retry-file', role: 'assistant', text: '[report](D:/work/report.pdf)' }), /upload failed/);
+assert(!fileState.delivered.A.includes('retry-file'), 'a transient upload failure is not a completed delivery');
+fileBridge.telegram = async (method, args) => {
+  if (method === 'sendDocument') throw Object.assign(new Error('ENOENT: missing file'), { code: 'ENOENT' });
+  fileSends.push({ method, args }); return { message_id: fileSends.length };
+};
 await fileBridge.deliver('A', { key: 'missing-file', role: 'assistant', text: '[missing](D:/work/missing.pdf)' });
 assert(fileSends.at(-1).args.text.includes('D:/work/missing.pdf'));
-assert(fileSends.at(-1).args.text.includes('upload failed'));
+assert(fileSends.at(-1).args.text.includes('ENOENT'));
 const fileTestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-upload-'));
 try {
   const file = path.join(fileTestDir, 'sample.txt');
+  const directoryLink = '[thư mục](<' + fileTestDir.replaceAll('\\', '/') + '>)';
+  assert.deepEqual(localFileParts(directoryLink), [{ text: directoryLink }], 'directory links stay text without an upload error');
   fs.writeFileSync(file, 'FILE_BYTES_OK');
   const form = await telegramFileBody({ chat_id: 123, message_thread_id: 101, document: file, caption: 'sample' });
   assert.equal(await form.get('document').text(), 'FILE_BYTES_OK');
@@ -371,7 +395,7 @@ fullBridge.fullHistory = async () => ({ turns: fullTurns });
 await fullBridge.handle({ message: fullMessage });
 await fullBridge.syncing.get('A');
 assert.equal(fullBridge.state.topics.A, 202);
-assert.equal(fullBridge.state.pending, undefined);
+assert.equal(Object.keys(fullBridge.state.pendingOps).length, 0);
 assert.equal(fullBridge.syncing.has('A'), false);
 assert(fullBridge.state.historyImported.A);
 assert(fullActions.some(a => a.args.text?.includes('Full answer 0') && a.args.message_thread_id === 202));
@@ -402,7 +426,7 @@ for (const failure of ['copy', 'delete', 'rights']) {
   await failedFull.syncing.get('A');
   assert.equal(actions.filter(a => a === 'deleteForumTopic').length, failure === 'delete' ? 1 : 0);
   assert.equal(state.topics.A, failure === 'delete' ? 303 : 101);
-  assert.equal(state.pending, undefined);
+  assert.equal(Object.keys(state.pendingOps).length, 0);
   if (failure !== 'delete') assert.deepEqual(state.delivered.A, ['old-delivery'], 'failed copy preserves old delivery state');
 }
 let releaseFull;
@@ -955,7 +979,7 @@ firstReplayBridge = new Bridge({ ownerId: owner, chatId: -1001234 }, firstReplay
 }, () => {}, undefined, async (text, topicId) => {
   assert.equal(topicId, 909); assert.equal(text, 'First prompt');
   assert.equal(firstReplayState.historyPending['-1001234:909'], text);
-  await firstReplayBridge.scan(); // Model responses must wait until initial replay completes.
+  await firstReplayBridge.scan({ wait: false }); // Model responses must wait until initial replay completes.
   await firstReplayBridge.handle({ message: { ...msg, text, message_id: 123, message_thread_id: topicId,
     chat: { id: -1001234, type: 'supergroup' } } });
   return { id: 123 };
@@ -973,7 +997,7 @@ creationFails = true;
 await creator.handle(input('Uncertain title'));
 await creator.handle(input('uncertain creation'));
 assert.equal(createCalls.filter(c => c.tool === 'create_thread').length, 2, 'creation must not retry on timeout');
-assert.equal(createState.pending, undefined);
+assert.equal(Object.keys(createState.pendingOps).length, 0);
 assert.deepEqual(createState.newChats, {});
 await creator.handle(click('newchat:P'));
 projectAvailable = false;
@@ -1045,7 +1069,7 @@ try {
   await imageBridge.handle({ message: imageMessage });
   assert.equal(imageCalls.length, priorImageCalls, 'failed download must not dispatch a text-only prompt');
   assert(imageReplies.at(-1).text.includes('Chưa nhận được'));
-  assert.equal(imageBridge.state.pending, undefined);
+  assert.equal(Object.keys(imageBridge.state.pendingOps).length, 0);
   await imageBridge.handle({ message: { ...imageMessage, photo: undefined, caption: undefined, text: '/help@OUR_BOT' } });
   assert(imageReplies.at(-1).text.includes('/projects'));
 

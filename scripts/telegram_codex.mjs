@@ -12,6 +12,16 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOCAL = path.join(ROOT, '.telegram-codex');
 const MAX_FRAME = 8 * 1024 * 1024;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const localTurnCache = new Map();
+
+function historyTail(file, size) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const bytes = Buffer.alloc(Math.min(size, 256));
+    fs.readSync(fd, bytes, 0, bytes.length, size - bytes.length);
+    return bytes;
+  } finally { fs.closeSync(fd); }
+}
 
 export function saveJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -68,12 +78,12 @@ export function findPipe() {
   return '\\\\.\\pipe\\' + names[0];
 }
 
-export async function appCall(callerThreadId, tool, args) {
+export async function appCall(callerThreadId, tool, args, timeout = 30000) {
   const response = await pipeRequest(findPipe(), 'tools/call', {
     arguments: args, callerSource: 'codex', hostId: 'local', namespace: 'codex_app',
     threadId: callerThreadId, tool,
     callId: 'telegram-' + crypto.randomUUID(), turnId: 'telegram-' + crypto.randomUUID(),
-  });
+  }, timeout);
   const text = response.contentItems?.filter(item => item.type === 'inputText').map(item => item.text).join('\n');
   if (!response.success) throw new Error(text || 'Codex App từ chối thao tác.');
   try { return JSON.parse(text); } catch { return { message: text }; }
@@ -82,8 +92,16 @@ export async function appCall(callerThreadId, tool, args) {
 export async function readLocalTurnPage(threadId, { cursor, all = false } = {}, codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex'), selectedFile) {
   if (!/^[a-f0-9-]{36}$/i.test(threadId)) throw new Error('ID chat local không hợp lệ.');
   const root = path.join(codexHome, 'sessions');
-  const files = selectedFile ? [selectedFile] : fs.readdirSync(root, { recursive: true }).filter(name =>
+  let files = selectedFile ? [selectedFile] : fs.readdirSync(root, { recursive: true }).filter(name =>
     name.endsWith('-' + threadId + '.jsonl') || (all && path.basename(name).includes('-' + threadId + '_'))).sort();
+  if (!selectedFile && !all && files.length !== 1 && fs.existsSync(path.join(codexHome, 'state_5.sqlite'))) {
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'), { readOnly: true });
+    try {
+      const owned = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(threadId)?.rollout_path;
+      if (owned && fs.existsSync(owned)) files = [owned];
+    } finally { db.close(); }
+  }
   if (all && files.length > 1) {
     const merged = new Map();
     for (const file of files) {
@@ -104,10 +122,22 @@ export async function readLocalTurnPage(threadId, { cursor, all = false } = {}, 
       !Number.isSafeInteger(anchor.rolloutOrdinal) || anchor.rolloutOrdinal < 0 || typeof anchor.includeAnchor !== 'boolean')) {
     throw new Error('Mốc lịch sử không hỗ trợ đọc local; chưa đồng bộ.');
   }
-  let ordinal = -1, bound = false, anchorFound = !anchor, turn, hasPrevious = false;
+  const filename = path.isAbsolute(files[0]) ? files[0] : path.join(root, files[0]), stat = fs.statSync(filename);
+  if (!stat.size) throw new Error('Chưa xác minh được file/mốc lịch sử local.');
+  const cached = !all && !anchor && localTurnCache.get(filename);
+  // Rollouts append. Verify file identity and the old tail before resuming;
+  // truncation, replacement, and rewrites must rebuild the projection.
+  const resume = cached && stat.ino === cached.ino && stat.size >= cached.size &&
+    (stat.size > cached.size || stat.mtimeMs === cached.mtimeMs) &&
+    historyTail(filename, cached.size).equals(cached.tail) ? cached : null;
+  let ordinal = resume?.ordinal ?? -1, bound = !!resume, anchorFound = !anchor,
+    turn = resume?.turn && structuredClone(resume.turn), hasPrevious = resume?.hasPrevious || false;
   const previousTurns = [];
-  const input = fs.createReadStream(path.join(root, files[0]));
-  const lines = createInterface({ input, crlfDelay: Infinity });
+  const offset = resume?.size || 0;
+  const input = offset === stat.size ? null : fs.createReadStream(filename, {
+    start: offset, end: stat.size - 1, highWaterMark: 1024 * 1024,
+  });
+  const lines = input ? createInterface({ input, crlfDelay: Infinity }) : [];
   try {
     for await (const line of lines) {
       ordinal++;
@@ -159,8 +189,14 @@ export async function readLocalTurnPage(threadId, { cursor, all = false } = {}, 
           output: typeof item.output === 'string' ? { text: item.output } : item.output });
       }
     }
-  } finally { lines.close(); input.destroy(); }
+  } finally { lines.close?.(); input?.destroy(); }
   if (!bound || !anchorFound) throw new Error('Chưa xác minh được file/mốc lịch sử local.');
+  if (!all && !anchor) {
+    const tail = historyTail(filename, stat.size);
+    // A partial final line is reread on the next poll, never cached as consumed.
+    if (tail.at(-1) === 10) localTurnCache.set(filename, { size: stat.size, ino: stat.ino,
+      mtimeMs: stat.mtimeMs, tail, ordinal, hasPrevious, turn: turn && structuredClone(turn) });
+  }
   const nextCursor = !all && turn && hasPrevious ? JSON.stringify({ requestedThreadId: threadId,
     rolloutOrdinal: turn.ordinal, includeAnchor: false, scope: { kind: 'turns' } }) : null;
   const projected = [...previousTurns, ...(turn ? [turn] : [])];
@@ -175,7 +211,7 @@ export async function readLocalTurnPage(threadId, { cursor, all = false } = {}, 
 export async function readThread(call, args, codexHome) {
   try { return await call('read_thread', args); }
   catch (error) {
-    if (!error.message.startsWith('Thread history exceeds the read size limit.')) throw error;
+    if (!/^(?:Thread history exceeds the read size limit\.|Tool response exceeds the size limit\.)/.test(error.message)) throw error;
     const result = await readLocalTurnPage(args.threadId, args, codexHome);
     if (!args.cursor) {
       const thread = localThreads(await call('list_threads', { limit: 50 })).find(t => t.id === args.threadId);
@@ -464,7 +500,7 @@ function delegationText(text) {
 }
 
 export function localFileParts(text) {
-  const pattern = /!?\[([^\]\n]*)\]\(<?(\/?[A-Za-z]:[\\/](?:[^()\n]|\([^()\n]*\))*?)>?\)|`([A-Za-z]:[\\/][^`\n]+)`|([A-Za-z]:[\\/][^\s`<>"|]*\.[A-Za-z0-9]{1,10})(?=[\s,;!?)]|$)/g;
+  const pattern = /!?\[([^\]\n]*)\]\(<?(\/?[A-Za-z]:[\\/](?:[^()\n]|\([^()\n]*\))*?)>?\)|`([A-Za-z]:[\\/][^`\n]+)`|(?<![A-Za-z0-9_])([A-Za-z]:[\\/][^\s`<>"|]*\.[A-Za-z0-9]{1,10})(?=[\s,;!?)]|$)/g;
   const parts = [];
   let end = 0;
   for (const match of text.matchAll(pattern)) {
@@ -473,6 +509,8 @@ export function localFileParts(text) {
     if (file.startsWith('/')) file = file.slice(1);
     file = file.replace(/:\d+(?::\d+)?$/, '');
     try { file = decodeURI(file); } catch { /* Keep literal filenames with %. */ }
+    try { if (fs.statSync(file).isDirectory()) continue; }
+    catch { /* Missing files still get the existing upload error notice. */ }
     if (match.index > end) parts.push({ text: text.slice(end, match.index) });
     parts.push({ file, label: match[1] || path.win32.basename(file), original: match[0] });
     end = match.index + match[0].length;
@@ -481,8 +519,8 @@ export function localFileParts(text) {
   return parts;
 }
 
-export async function telegramFileBody(body) {
-  const file = fs.realpathSync(body.document);
+export function checkedTelegramFile(filename) {
+  const file = fs.realpathSync(filename);
   const segments = file.replace(/\\/g, '/').split('/');
   if (segments.some((s, i) => /^\.env(?:\.|$)/i.test(s) ||
       ['.telegram-codex', '.git', '.aws', '.ssh'].includes(s.toLowerCase()) ||
@@ -491,6 +529,11 @@ export async function telegramFileBody(body) {
   }
   const stat = fs.statSync(file);
   if (!stat.isFile()) throw new Error('Đường dẫn không phải file.');
+  return { file, stat };
+}
+
+export async function telegramFileBody(body) {
+  const { file, stat } = checkedTelegramFile(body.document);
   if (stat.size > 50 * 1024 * 1024) throw new Error('File vượt giới hạn gửi 50 MB.');
   const form = new FormData();
   for (const [key, value] of Object.entries(body)) {
@@ -551,6 +594,7 @@ export class Bridge {
   constructor(config, state, call, telegram, persist, receiveImage = file => saveTelegramImage(file, telegram, config.token), sendPersonal, interrupt = interruptChat, readProjectState = readCodexProjectState) {
     this.config = config;
     this.state = state;
+    this.rawCall = call;
     this.call = (tool, args) => tool === 'read_thread' ? readThread(call, args) : call(tool, args);
     this.telegram = telegram;
     this.persist = persist;
@@ -567,8 +611,27 @@ export class Bridge {
     this.fullHistory = id => readLocalTurnPage(id, { all: true });
     this.prepareQuestion = (id, questions, answer) => prepareQuestionReply(id, questions, answer, this.call);
     this.readErrors = new Map();
+    this.localReadUntil = new Map();
+    this.inventoryStale = false;
     this.creatingTopics = new Map();
     this.syncing = new Map();
+    this.scans = new Map();
+    this.scanQueue = [];
+    this.scansRunning = 0;
+    this.incoming = new Map();
+    this.deliveryWorkers = new Map();
+    this.approvalWork = new Map();
+    this.deliveries = new Map();
+    this.pauseDelivery = sleep;
+    this.state.outbox ||= {};
+    this.state.deliveryParts ||= {};
+    this.state.readPending ||= {};
+    this.state.inbox ||= {};
+    this.state.pendingOps ||= {};
+    if (this.state.pending) {
+      this.state.pendingOps.legacy = this.state.pending;
+      delete this.state.pending;
+    }
     this.state.topics ||= {};
     this.state.projects ||= {};
     this.state.newChats ||= {};
@@ -626,34 +689,88 @@ export class Bridge {
   }
 
   async deliver(threadId, event, armQuestion = false) {
+    const topic = this.state.topicMode ? await this.topic(threadId) : 0;
+    const key = threadId + ':' + topic + ':' + event.key;
+    if (!this.deliveries.has(key)) this.deliveries.set(key, this.deliverEvent(threadId, event, armQuestion, key));
+    const work = this.deliveries.get(key);
+    try { return await work; }
+    finally { if (this.deliveries.get(key) === work) this.deliveries.delete(key); }
+  }
+
+  async deliverEvent(threadId, event, armQuestion, key) {
     const delivered = this.state.delivered[threadId] ||= [];
     if (delivered.includes(event.key)) return;
+    const progress = this.state.deliveryParts[key] ||= { next: 0 };
     if (event.role === 'user' && event.origin === 'telegram') {
       // The original Telegram prompt is already visible in the topic.
     } else if (event.role === 'user' && this.sendPersonal && this.state.topicMode) {
       const topicId = await this.topic(threadId);
-      for (const part of chunks(event.text)) {
+      progress.parts ||= chunks(event.text).map(text => ({ text }));
+      for (let index = progress.next; index < progress.parts.length; index++) {
+        const receipt = progress.parts[index], part = receipt.text;
         const pendingKey = this.config.chatId + ':' + topicId;
+        receipt.pendingKey = pendingKey;
+        receipt.randomId ||= crypto.randomBytes(8).readBigInt64LE().toString();
         this.state.historyPending[pendingKey] = part;
         this.persist();
-        const sent = await this.sendPersonal(part, topicId);
+        const sent = receipt.receivedId ? { id: receipt.receivedId } : await this.sendPersonal(part, topicId, receipt);
         this.state.ignoredPrompts[this.config.chatId + ':' + sent.id] = true;
         delete this.state.historyPending[pendingKey];
+        progress.next = index + 1;
         this.persist();
       }
     } else {
       const text = event.finalAnswer && !event.text.trimEnd().endsWith('[end]') ? event.text.trimEnd() + '\n[end]' : event.text;
-      await this.send((event.role === 'user' ? 'Bạn:\n' : '') + text, threadId, {}, event.role === 'assistant');
+      await this.send((event.role === 'user' ? 'Bạn:\n' : '') + text, threadId, {}, event.role === 'assistant', progress);
     }
     delivered.push(event.key);
+    delete this.state.deliveryParts[key];
     if (armQuestion && event.question) this.state.awaitingQuestions[threadId] = event.key;
     this.persist();
+  }
+
+  queueDelivery(threadId, event, armQuestion = false) {
+    if (this.state.delivered[threadId]?.includes(event.key)) return;
+    const queue = this.state.outbox[threadId] ||= [];
+    if (!queue.some(item => item.event.key === event.key)) {
+      queue.push({ event, armQuestion });
+      this.persist();
+    }
+    this.startDelivery(threadId);
+  }
+
+  startDelivery(threadId) {
+    if (this.deliveryWorkers.has(threadId)) return this.deliveryWorkers.get(threadId);
+    const work = this.drainDelivery(threadId).finally(() => this.deliveryWorkers.delete(threadId));
+    this.deliveryWorkers.set(threadId, work);
+    void work.catch(error => console.error(new Date().toISOString(), 'Hàng gửi', threadId + ':', error.message));
+    return work;
+  }
+
+  async drainDelivery(threadId) {
+    const queue = this.state.outbox[threadId];
+    while (queue?.length && !this.syncing.has(threadId)) {
+      const item = queue[0];
+      try { await this.deliver(threadId, item.event, item.armQuestion); }
+      catch (error) {
+        item.attempts = (item.attempts || 0) + 1;
+        item.error = error.message;
+        this.persist();
+        console.error(new Date().toISOString(), 'Chưa gửi xong; giữ hàng chờ', threadId + ':', error.message);
+        await this.pauseDelivery(Math.max(Number(error.seconds || 0) * 1000,
+          Math.min(60000, 1000 * 2 ** Math.min(item.attempts, 6))));
+        continue;
+      }
+      queue.shift();
+      if (!queue.length) delete this.state.outbox[threadId];
+      this.persist();
+    }
   }
 
   async update(threadId) {
     if (!this.syncing.has(threadId)) this.syncing.set(threadId, this.pullUpdate(threadId));
     try { return await this.syncing.get(threadId); }
-    finally { this.syncing.delete(threadId); }
+    finally { this.syncing.delete(threadId); await this.startDelivery(threadId); }
   }
 
   async importRecentHistory(threadId) {
@@ -676,10 +793,11 @@ export class Bridge {
         (!i.phase || i.phase === 'final_answer')).map(i => i.id));
       for (const event of conversationEvents([turn])) {
         if (event.role === 'user' || finalIds.has(event.key) || event.key === turn.id + ':error') {
-          await this.deliver(threadId, { ...event, origin: 'desktop' });
+          this.queueDelivery(threadId, { ...event, origin: 'desktop' });
         }
       }
     }
+    await this.startDelivery(threadId);
     this.state.historyImported[threadId] = true;
     this.persist();
   }
@@ -743,44 +861,59 @@ export class Bridge {
     } while (cursor && !all.some(event => event.role === 'user' && event.origin === 'telegram'));
     const boundary = all.findLastIndex(event => event.role === 'user' && event.origin === 'telegram');
     if (boundary < 0) return this.send('Chưa xác định được prompt Telegram làm mốc; chưa nhập tin desktop.', threadId);
-    await this.deliver(threadId, all[boundary]);
+    this.queueDelivery(threadId, all[boundary]);
     let count = 0;
     for (const event of all.slice(boundary + 1)) {
       if (event.origin === 'telegram' || this.state.delivered[threadId]?.includes(event.key)) continue;
-      await this.deliver(threadId, event);
+      this.queueDelivery(threadId, event);
       count++;
     }
     this.persist();
     if (!count) await this.send('Chưa có tin mới từ prompt trên desktop.', threadId);
   }
 
-  async send(text, threadId, extra = {}, attachFiles = false) {
+  async send(text, threadId, extra = {}, attachFiles = false, progress) {
     const topicId = threadId && this.state.topicMode ? await this.topic(threadId) : null;
     if (threadId && !this.state.topicMode) text = '[' + this.state.threads[threadId].title + ']\n' + text;
     const destination = { chat_id: this.config.chatId || this.config.ownerId, ...extra,
       ...(topicId ? { message_thread_id: topicId } : {}) };
-    const parts = attachFiles ? localFileParts(text) : [{ text }];
-    for (const part of parts) {
+    const parts = progress?.parts || (attachFiles ? localFileParts(text) : [{ text }]).flatMap(part =>
+      part.file ? [part] : chunks(part.text || '').filter(text => text.trim()).map(text => ({ text })));
+    if (progress && !progress.parts) { progress.parts = parts; this.persist(); }
+    for (let index = progress?.next || 0; index < parts.length; index++) {
+      const part = parts[index];
       if (part.file) {
         try {
           const sent = await this.telegram('sendDocument', { ...destination, document: part.file, caption: part.label.slice(0, 1024) });
           if (threadId) this.state.routes[destination.chat_id + ':' + sent.message_id] = threadId;
+          if (progress) progress.next = index + 1;
           this.persist();
           continue;
         } catch (error) {
+          // Keep transient/uncertain uploads pending. Invalid or forbidden local
+          // files retain the existing explicit path+reason notice.
+          if (progress && !['ENOENT', 'ENOTDIR', 'EISDIR', 'EACCES'].includes(error.code) &&
+              !/Không tự gửi file cấu hình|Đường dẫn không phải file/.test(error.message)) throw error;
           part.text = part.original + '\nChưa gửi được file: ' + error.message;
+          const replacement = chunks(part.text).map(text => ({ text }));
+          parts.splice(index, 1, ...replacement);
+          if (progress) this.persist();
+          index--;
+          continue;
         }
       }
-      for (const chunk of chunks(part.text || '')) {
-        if (!chunk.trim()) continue;
-        const sent = await this.telegram('sendMessage', { ...destination, text: chunk });
-        if (threadId) this.state.routes[(extra.chat_id || this.config.chatId || this.config.ownerId) + ':' + sent.message_id] = threadId;
-        this.persist();
-      }
+      const sent = await this.telegram('sendMessage', { ...destination, text: part.text });
+      if (threadId) this.state.routes[(extra.chat_id || this.config.chatId || this.config.ownerId) + ':' + sent.message_id] = threadId;
+      if (progress) progress.next = index + 1;
+      this.persist();
     }
   }
 
   async startApp(action = 'start', pause = sleep) {
+    if (action === 'start') {
+      try { await this.call('list_threads', { limit: 1 }); return true; }
+      catch { /* Launch only when the existing App connection is unavailable. */ }
+    }
     await this.appControl(action);
     if (action === 'restart') {
       this.state.controlActions = {}; this.state.approvalNotices = {}; this.persist();
@@ -921,8 +1054,9 @@ export class Bridge {
   }
 
   async createChat(project, title, prompt, updateId, reply) {
-    this.state.pending = { kind: 'create', projectId: project.projectId, updateId };
-    this.creatingChat = true;
+    const key = crypto.randomUUID();
+    const operation = this.state.pendingOps[key] = { kind: 'create', projectId: project.projectId, updateId };
+    this.creatingChat++;
     this.persist();
     let id;
     try {
@@ -941,22 +1075,52 @@ export class Bridge {
       this.state.selected = id;
       this.state.enabled[id] = true;
       (this.state.telegramPrompts[id] ||= []).push(prompt);
-      this.state.pending.threadId = id;
+      operation.threadId = id;
       this.persist();
+      if (this.state.topicMode) {
+        // Persist the initial prompt before a nonessential acknowledgement can fail.
+        this.queueDelivery(id, { key: 'initial-prompt:' + id, role: 'user', text: prompt, origin: 'desktop' });
+      }
       await this.send('Đã tạo chat mới trong project ' + project.label +
         '. Tiếp tục nhắn tại topic này.', id);
       if (this.state.topicMode) {
         // The first prompt was sent in the creation topic, not this new topic.
-        await this.deliver(id, { key: 'initial-prompt:' + id, role: 'user', text: prompt, origin: 'desktop' });
+        await this.startDelivery(id);
       }
     } catch (error) {
       await reply((id ? 'Chat đã được tạo, nhưng chưa hoàn tất thông báo Telegram: ' :
         'Tạo chat chưa được xác nhận: ') + error.message + '\nBot không tự tạo lại để tránh trùng chat.');
     } finally {
-      this.creatingChat = false;
-      delete this.state.pending;
+      this.creatingChat--;
+      delete this.state.pendingOps[key];
       this.persist();
     }
+  }
+
+  enqueue(update) {
+    const message = update.message || update.callback_query?.message;
+    const key = this.state.topicMode && message ? menuContext(message) : 'legacy';
+    // Persist waiting inputs before advancing getUpdates. On restart only inputs
+    // that never began handling are resumed; uncertain submissions are not replayed.
+    this.state.inbox[update.update_id] = update;
+    this.state.offset = Math.max(this.state.offset || 0, update.update_id + 1);
+    this.persist();
+    const work = (this.incoming.get(key) || Promise.resolve()).catch(() => {}).then(async () => {
+      delete this.state.inbox[update.update_id];
+      this.persist();
+      try { await this.handle(update); }
+      catch (error) {
+        console.error(new Date().toISOString(), 'Xử lý Telegram', key + ':', error.message);
+        if (message) await this.send('Lỗi xử lý Telegram: ' + error.message, null, {
+          chat_id: message.chat.id,
+          ...(message.message_thread_id == null ? {} : { message_thread_id: message.message_thread_id }),
+        });
+      }
+    }).finally(() => {
+      if (this.incoming.get(key) === work) this.incoming.delete(key);
+    });
+    this.incoming.set(key, work);
+    return work;
   }
 
   async handle(update) {
@@ -980,6 +1144,15 @@ export class Bridge {
       if (this.state.ignoredPrompts[message.chat.id + ':' + message.message_id]) return;
       const pending = this.state.historyPending[message.chat.id + ':' + message.message_thread_id];
       if (pending != null && pending === message.text) {
+        const key = message.chat.id + ':' + message.message_thread_id;
+        const part = Object.values(this.state.deliveryParts).flatMap(progress => progress.parts || [])
+          .find(part => part.pendingKey === key && part.text === message.text && !part.receivedId);
+        if (part) {
+          part.receivedId = message.message_id;
+          this.state.ignoredPrompts[message.chat.id + ':' + message.message_id] = true;
+          this.persist();
+          return;
+        }
         return controlReply('Tin này khớp prompt lịch sử có kết quả gửi chưa xác định. Bot không chạy lại; kiểm tra lịch sử topic trước.');
       }
     }
@@ -1061,7 +1234,7 @@ export class Bridge {
         return controlReply('Gửi /full trong topic đã nối với một chat Codex; không dùng trong General hoặc private chat.');
       }
       await controlReply('Đang chép toàn bộ lịch sử sang topic mới. Chỉ xóa topic này sau khi chép xong.');
-      const work = this.replaceTopic(id, message.message_thread_id)
+      const work = Promise.resolve(this.deliveryWorkers.get(id)).then(() => this.replaceTopic(id, message.message_thread_id))
         .catch(error => controlReply('Chưa thay topic; topic cũ được giữ nguyên. ' + error.message))
         .finally(() => this.syncing.delete(id));
       this.syncing.set(id, work);
@@ -1172,23 +1345,34 @@ export class Bridge {
     }
     text = submission?.prompt || text;
     // Persist intent before dispatch. Never replay an uncertain prompt on restart.
-    this.state.pending = { updateId: update.update_id, threadId: id };
+    const pendingKey = crypto.randomUUID();
+    this.state.pendingOps[pendingKey] = { updateId: update.update_id, threadId: id };
     (this.state.telegramPrompts[id] ||= []).push(text);
     this.persist();
+    let result;
     try {
-      const result = submission ? await submission.send() :
+      result = submission ? await submission.send() :
         await this.call('send_message_to_thread', { threadId: id, hostId: 'local', prompt: text });
-      await this.send(result.message || 'Codex App đã nhận prompt.', id);
     } catch (error) {
-      await this.send('Gửi chưa được xác nhận: ' + error.message + '\nBot không tự gửi lại. Kiểm tra chat trên máy trước khi gửi lại.', id);
+      return await this.send('Gửi chưa được xác nhận: ' + error.message + '\nBot không tự gửi lại. Kiểm tra chat trên máy trước khi gửi lại.', id);
     } finally {
-      delete this.state.pending;
+      delete this.state.pendingOps[pendingKey];
       this.persist();
     }
+    // An acknowledgement delivery failure does not undo Codex's acceptance.
+    await this.send(result.message || 'Codex App đã nhận prompt.', id);
   }
 
-  async scanDesktop() {
-    const threads = localThreads(await this.call('list_threads', { limit: 50 }), this.readProjectState());
+  async scanDesktop(options) {
+    let inventory;
+    try {
+      inventory = await this.rawCall('list_threads', { limit: 50 }, { timeout: 5000 });
+      this.inventoryStale = false;
+    } catch (error) {
+      this.inventoryStale = error.message === 'Codex App timeout; kết quả chưa xác định.';
+      throw error;
+    }
+    const threads = localThreads(inventory, this.readProjectState());
     // First enablement establishes a baseline; subsequent discoveries are new chats.
     if (!this.state.realtimeBaseline) {
       this.state.realtimeBaseline = Object.fromEntries(
@@ -1200,77 +1384,135 @@ export class Bridge {
       this.state.enabled[thread.id] = true;
     }
     this.persist();
-    await this.scan();
+    await this.scan(options);
   }
 
-  async scan() {
+  async readDesktopPage(args) {
+    const local = () => readLocalTurnPage(args.threadId, args);
+    if (this.inventoryStale || (this.localReadUntil.get(args.threadId) || 0) > Date.now()) return local();
+    try {
+      // Background reads are safe to abandon. Prompt/control submissions keep
+      // their original timeout and must never be replayed after uncertainty.
+      return await readThread((tool, body) => this.rawCall(tool, body, { timeout: 5000 }), args);
+    } catch (error) {
+      if (error.message !== 'Codex App timeout; kết quả chưa xác định.') throw error;
+      this.localReadUntil.set(args.threadId, Date.now() + 60000);
+      console.error(new Date().toISOString(), 'App đọc chậm; dùng lịch sử local:', args.threadId);
+      return local();
+    }
+  }
+
+  async scan({ wait = true } = {}) {
+    for (const id of Object.keys(this.state.outbox)) this.startDelivery(id);
+    const jobs = [];
     for (const id of Object.keys(this.state.enabled).filter(id => this.state.enabled[id])) {
-      const thread = this.state.threads[id];
-      if (!thread) continue;
-      if (this.syncing.has(id)) continue;
-      // Keep the copied first prompt ahead of responses, including fast turns.
-      if (this.state.pending?.kind === 'create' && this.state.pending.threadId === id) continue;
-      try {
-        const prior = this.state.seen[id];
-        const realtime = !!this.state.realtimeBaseline;
-        const baseline = !!this.state.realtimeBaseline?.[id];
-        if (realtime && !prior && this.creatingChat) continue;
-        const active = (typeof thread.status === 'string' ? thread.status : thread.status?.type) === 'active';
-        if (realtime && !baseline && prior && !active && !prior.wasActive &&
-          prior.updatedAt === thread.updatedAt && !this.state.telegramPrompts[id]?.length) continue;
-        if (realtime && !baseline && !prior && this.state.topicMode) await this.topic(id);
-        const turns = [];
-        let cursor, status;
-        // Walk back to the last observed turn, so fast consecutive turns aren't lost.
-        do {
-          const result = await this.call('read_thread', {
-            threadId: id, hostId: 'local', turnLimit: 1, includeOutputs: true,
-            maxOutputCharsPerItem: 20000, ...(cursor ? { cursor } : {}),
-          });
-          status ||= result.thread?.status;
-          turns.push(...(result.turns || []));
-          cursor = result.page?.nextCursor;
-        } while (prior && !baseline && cursor && !turns.some(t => t.id === prior.turnId));
-        if (this.syncing.has(id)) continue;
+      if (!this.scans.has(id)) {
+        const job = new Promise(resolve => this.scanQueue.push({ id, resolve }));
+        this.scans.set(id, job);
+      }
+      jobs.push(this.scans.get(id));
+    }
+    this.drainScans();
+    if (wait) {
+      await Promise.all(jobs);
+      await Promise.all([...this.approvalWork.values()]);
+      await Promise.all([...this.deliveryWorkers.values()]);
+    }
+  }
+
+  drainScans() {
+    // Bound App reads; a stalled chat occupies one slot, not the whole scan loop.
+    while (this.scansRunning < 4 && this.scanQueue.length) {
+      const { id, resolve } = this.scanQueue.shift();
+      this.scansRunning++;
+      void this.scanThread(id).catch(error => {
+        console.error(new Date().toISOString(), 'Đồng bộ chat', id + ':', error.message);
+      }).finally(() => {
+        this.scansRunning--;
+        this.scans.delete(id);
+        resolve();
+        this.drainScans();
+      });
+    }
+  }
+
+  async scanThread(id) {
+    const thread = this.state.threads[id];
+    if (!thread || !this.state.enabled[id]) return;
+    if (this.syncing.has(id)) return;
+    // Keep the copied first prompt ahead of responses, including fast turns.
+    if (Object.values(this.state.pendingOps).some(op => op.kind === 'create' && op.threadId === id)) return;
+    try {
+      const prior = this.state.seen[id];
+      const realtime = !!this.state.realtimeBaseline;
+      const baseline = !!this.state.realtimeBaseline?.[id];
+      if (realtime && !prior && this.creatingChat) return;
+      const active = (typeof thread.status === 'string' ? thread.status : thread.status?.type) === 'active';
+      if (realtime && !this.inventoryStale && !this.state.readPending[id] && !baseline && prior && !active && !prior.wasActive &&
+        prior.updatedAt === thread.updatedAt && !this.state.telegramPrompts[id]?.length) return;
+      if (realtime && !baseline && !prior && this.state.topicMode) await this.topic(id);
+      const turns = [];
+      let cursor, status;
+      // Walk back to the last observed turn, so fast consecutive turns aren't lost.
+      do {
+        const result = await this.readDesktopPage({
+          threadId: id, hostId: 'local', turnLimit: 1, includeOutputs: true,
+          maxOutputCharsPerItem: 20000, ...(cursor ? { cursor } : {}),
+        });
+        status ||= result.thread?.status;
+        turns.push(...(result.turns || []));
+        cursor = result.page?.nextCursor;
+      } while (prior && !baseline && cursor && !turns.some(t => t.id === prior.turnId));
+      if (this.syncing.has(id)) return;
+      if (status) {
         const flags = status?.activeFlags || [];
         const waiting = flags.filter(flag => ['waitingOnApproval', 'waitingOnUserInput'].includes(flag));
-        if (waiting.length) {
-          try { await this.approvalMenu(id); }
-          catch (error) { console.error('Đọc lựa chọn cấp quyền:', error.message); }
+        if (waiting.length && !this.approvalWork.has(id)) {
+          const work = this.approvalMenu(id)
+            .catch(error => console.error('Đọc lựa chọn cấp quyền:', error.message))
+            .finally(() => this.approvalWork.delete(id));
+          this.approvalWork.set(id, work);
         }
         const attention = waiting.length ? turns[0]?.id + ':' + waiting.join(',') : '';
         if (attention && this.state.attention[id] !== attention) {
-          await this.send(waiting.includes('waitingOnApproval') ?
+          this.state.attention[id] = attention;
+          this.queueDelivery(id, { key: 'attention:' + attention + ':' + crypto.randomUUID(), role: 'assistant', text: waiting.includes('waitingOnApproval') ?
             '⚠️ Codex đang chờ bạn cấp quyền. Dùng nút lựa chọn nếu đã hiện; yêu cầu không có nút cần xử lý trong App. /cancel để dừng lượt này.' :
-            '⚠️ Codex đang chờ bạn trả lời câu hỏi trong App. /update để xem tin mới; /cancel để dừng.', id);
+            '⚠️ Codex đang chờ bạn trả lời câu hỏi trong App. /update để xem tin mới; /cancel để dừng.' });
         }
         this.state.attention[id] = attention;
-        const all = this.sourcedEvents(id, turns);
-        for (const event of all) {
-          if (this.syncing.has(id)) break;
-          // Questions need attention even for desktop prompts; do not backfill old completed questions.
-          const newQuestion = event.question && (event.activeQuestion || (prior && !prior.keys.includes(event.key)));
-          if (realtime ? !baseline && !prior?.keys?.includes(event.key) : event.origin === 'telegram' || newQuestion) {
-            await this.deliver(id, event, !!newQuestion);
-          }
+      }
+      const all = this.sourcedEvents(id, turns);
+      for (const event of all) {
+        if (this.syncing.has(id)) break;
+        // Questions need attention even for desktop prompts; do not backfill old completed questions.
+        const newQuestion = event.question && (event.activeQuestion || (prior && !prior.keys.includes(event.key)));
+        if (realtime ? !baseline && !prior?.keys?.includes(event.key) : event.origin === 'telegram' || newQuestion) {
+          this.queueDelivery(id, event, !!newQuestion);
         }
-        if (this.syncing.has(id)) continue;
-        this.state.seen[id] = {
-          turnId: turns[0]?.id,
-          keys: all.map(event => event.key),
-          updatedAt: thread.updatedAt,
-          wasActive: (status?.type || (active ? 'active' : 'idle')) === 'active' || turns[0]?.status === 'inProgress',
-        };
-        if (status) thread.status = status;
-        if (baseline) delete this.state.realtimeBaseline[id];
-        this.persist();
-        this.readErrors.delete(id);
-      } catch (error) {
-        if (this.readErrors.get(id) !== error.message) {
-          if (this.state.realtimeBaseline?.[id]) console.error('Chưa ghi được mốc chat local:', error.message);
-          else await this.send('Không đọc được chat: ' + error.message, id);
-          this.readErrors.set(id, error.message);
+      }
+      if (this.syncing.has(id)) return;
+      this.state.seen[id] = {
+        turnId: turns[0]?.id,
+        keys: all.map(event => event.key),
+        updatedAt: thread.updatedAt,
+        wasActive: (status?.type || (active ? 'active' : 'idle')) === 'active' || turns[0]?.status === 'inProgress',
+      };
+      if (status) thread.status = status;
+      if (baseline) delete this.state.realtimeBaseline[id];
+      delete this.state.readPending[id];
+      this.persist();
+      this.readErrors.delete(id);
+    } catch (error) {
+      this.state.readPending[id] = { error: error.message, since: this.state.readPending[id]?.since || new Date().toISOString() };
+      this.persist();
+      if (this.readErrors.get(id) !== error.message) {
+        console.error(new Date().toISOString(), 'Đọc chat', id + ':', error.message);
+        if (this.state.realtimeBaseline?.[id]) console.error('Chưa ghi được mốc chat local:', error.message);
+        else if (!/^(?:Codex App timeout;|fetch failed$|Không xác định được đúng một file lịch sử local)/.test(error.message)) {
+          await this.send('Không đọc được chat: ' + error.message, id);
         }
+        this.readErrors.set(id, error.message);
       }
     }
   }
@@ -1278,6 +1520,10 @@ export class Bridge {
 
 export async function telegram(token, method, body) {
   const upload = method === 'sendDocument' && typeof body.document === 'string' && /^[A-Za-z]:[\\/]/.test(body.document);
+  if (upload && checkedTelegramFile(body.document).stat.size > 50 * 1024 * 1024) {
+    const { sendBotFile } = await import('./telegram_user.mjs');
+    return sendBotFile(token, body);
+  }
   const response = await fetch('https://api.telegram.org/bot' + token + '/' + method, {
     method: 'POST', ...(upload ? { body: await telegramFileBody(body) } : {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -1331,7 +1577,7 @@ async function main() {
   }
   fs.writeFileSync(lock, String(process.pid), { flag: 'wx' });
   process.once('exit', () => { try { fs.unlinkSync(lock); } catch {} });
-  const call = (tool, args) => appCall(config.callerThreadId, tool, args);
+  const call = (tool, args, options) => appCall(config.callerThreadId, tool, args, options?.timeout);
   const tg = (method, body) => telegram(config.token, method, body);
   const me = await tg('getMe', {});
   config.botUsername = me.username;
@@ -1397,12 +1643,14 @@ async function main() {
     delete state.topicReplacements[operation.threadId];
     bridge.persist();
   }
-  if (state.pending) {
-    await bridge.send('Bot đã dừng khi đang gửi prompt hoặc tạo chat. Kết quả chưa xác định; kiểm tra App trước khi thử lại.', state.pending.threadId);
-    delete state.pending;
+  for (const [key, operation] of Object.entries(state.pendingOps)) {
+    await bridge.send('Bot đã dừng khi đang gửi prompt hoặc tạo chat. Kết quả chưa xác định; kiểm tra App trước khi thử lại.', operation.threadId);
+    delete state.pendingOps[key];
     bridge.persist();
   }
-  await bridge.send('Bot Telegram đã bật, đang mở Codex. Chat, prompt và phản hồi mới trên máy sẽ tự đồng bộ về Telegram. /projects chọn chat; /model đổi model.');
+  for (const id of Object.keys(state.outbox)) bridge.startDelivery(id);
+  void bridge.send('Bot Telegram đã bật, đang mở Codex. Chat, prompt và phản hồi mới trên máy sẽ tự đồng bộ về Telegram. /projects chọn chat; /model đổi model.')
+    .catch(error => console.error(new Date().toISOString(), 'Thông báo khởi động:', error.message));
   console.log('Bot đang chạy. Ctrl+C để dừng.');
   // Independent loops: a slow Codex read must not block incoming steering.
   void (async () => {
@@ -1414,31 +1662,41 @@ async function main() {
           if (!ready) throw new Error('Đã yêu cầu mở Codex nhưng App chưa trả lời. Bot sẽ thử lại.');
           console.log('Codex đã sẵn sàng, bắt đầu tự đồng bộ các chat local.');
         }
-        await bridge.scanDesktop(); lastError = '';
+        await bridge.scanDesktop({ wait: false }); lastError = '';
       }
       catch (error) {
-        console.error('Đọc Codex:', error.message);
+        console.error(new Date().toISOString(), 'Đọc Codex:', error.message);
         if (error.message !== lastError) {
-          try { await bridge.send('Lỗi cầu nối Codex: ' + error.message); } catch {}
+          if (error.message !== 'Codex App timeout; kết quả chưa xác định.') {
+            try { await bridge.send('Lỗi cầu nối Codex: ' + error.message); } catch {}
+          }
           lastError = error.message;
         }
       }
       await sleep(3000);
     }
   })();
+  // Inventory can stall independently of the visible histories already on disk.
+  void (async () => {
+    for (;;) {
+      if (state.realtimeBaseline) {
+        try { await bridge.scan({ wait: false }); }
+        catch (error) { console.error(new Date().toISOString(), 'Quét lịch sử:', error.message); }
+      }
+      await sleep(3000);
+    }
+  })();
+  const dispatch = update => {
+    void bridge.enqueue(update).catch(error => console.error(new Date().toISOString(), 'Trả lỗi Telegram:', error.message));
+  };
+  for (const update of Object.values(state.inbox).sort((a, b) => a.update_id - b.update_id)) dispatch(update);
   for (;;) {
     try {
       const updates = await tg('getUpdates', { offset: state.offset, timeout: 25, allowed_updates: ['message', 'callback_query'] });
       for (const update of updates) {
-        state.offset = update.update_id + 1;
-        bridge.persist();
-        try { await bridge.handle(update); }
-        catch (error) {
-          console.error('Xử lý Telegram:', error.message);
-          await bridge.send('Lỗi xử lý Telegram: ' + error.message);
-        }
+        dispatch(update);
       }
-    } catch (error) { console.error(error.message); await sleep(3000); }
+    } catch (error) { console.error(new Date().toISOString(), 'Telegram getUpdates:', error.message); await sleep(3000); }
   }
 }
 

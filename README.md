@@ -22,13 +22,18 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 - Tự phát hiện chat local mới trên desktop và tạo topic; prompt, phản hồi và lỗi
   mới tự chuyển về Telegram, không cần chọn chat trước hay dùng `/update`.
   Kiểm tra khoảng 3 giây; chat đứng yên được bỏ qua, độ trễ còn phụ thuộc App/Telegram.
+- Ưu tiên gửi đủ: mỗi chat có worker gửi độc lập, hàng chờ và tiến độ từng phần
+  được lưu xuống đĩa. Lỗi mạng/upload được thử lại; restart tiếp tục phần chưa
+  xác nhận. Chat gửi chậm không giữ slot đọc hoặc chặn chat khác.
 - Lần đầu bật ghi mốc chat cũ, không đổ lại lịch sử; mốc được giữ qua lần khởi động.
   Chọn chat từ menu vẫn nhập tối đa 20 lượt hỏi–đáp đã hoàn tất gần nhất một lần.
 - Nhắn trong topic để gửi prompt hoặc steer; tin được chép từ desktop không chạy lại.
 - Đường dẫn file local trong phản hồi được thay bằng file đính kèm, xen giữa
   các đoạn chữ theo đúng thứ tự. Hỗ trợ link Markdown, đường dẫn trong backtick
   và đường dẫn Windows thông thường; link web giữ nguyên. File không tồn tại,
-  vượt 50 MB hoặc gửi lỗi sẽ hiện đường dẫn kèm lý do. Bot không tự gửi file
+  không hợp lệ sẽ hiện đường dẫn kèm lý do. File trên 50 MiB dùng phiên MTProto
+  của bot với api_id/api_hash đã cấu hình ở bước tài khoản cá nhân; file nhỏ
+  dùng Bot API. Lỗi upload tạm thời giữ hàng chờ để gửi lại. Bot không tự gửi file
   `.env`, dữ liệu đăng nhập/runtime riêng hay thư mục; artifact trong
   `.codex/visualizations` vẫn được phép gửi.
 - `/update` giữ để tương thích luồng đồng bộ thủ công cũ sau prompt Telegram.
@@ -62,7 +67,8 @@ Lịch sử thay đổi và kiểm thử: [CHANGELOG.md](CHANGELOG.md).
 
 ## Yêu cầu
 
-- Windows, PowerShell, Node.js 20 trở lên và Git.
+- Windows, PowerShell, Node.js 24 (bản đã kiểm thử) và Git. Reader dùng
+  `node:sqlite` để tra index khi tên rollout local đã đổi.
 - Codex desktop đã đăng nhập, có bộ công cụ `codex-app-tools` hoạt động.
   Cầu nối sử dụng named pipe local `codex-app-tools-*` của App.
 - Một bot Telegram riêng tạo qua [@BotFather](https://t.me/BotFather).
@@ -280,6 +286,14 @@ Kiểm tra tự động không cần token hoặc mạng; probe đọc thử Cod
 
 ```powershell
 node tests/test_telegram_codex.mjs
+node tests/test_telegram_history.mjs
+node tests/test_telegram_controls.mjs
+node tests/test_telegram_user.mjs
+node tests/test_telegram_concurrency.mjs
+node tests/test_telegram_read_timeout.mjs
+node tests/test_telegram_outbox.mjs
+node tests/test_telegram_outbox_restart.mjs
+node tests/test_telegram_personal_receipts.mjs
 node --check scripts/telegram_codex.mjs
 # Chạy từ terminal của chat Codex:
 node scripts/telegram_codex.mjs --probe
@@ -291,6 +305,12 @@ không lặp phản hồi và không tự gửi lại thao tác chưa rõ kết 
 đã được thử thực tế: Telegram → prompt/steer → Codex → đúng topic; ảnh thật được
 Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử không nằm trong repo.
 
+Kiểm thử hàng gửi bao gồm bốn sender bị giữ trong khi chat thứ năm vẫn gửi,
+12 lỗi liên tiếp, file lỗi giữa tin dài, và hai tiến trình thật nối tiếp qua
+state trên đĩa sau khi tiến trình đầu dừng giữa chừng. Telegram trong các phép
+thử lỗi được giả lập. `test_telegram_startup.ps1 -LauncherOnly` kiểm tra vòng
+khởi động lại bằng tiến trình giả, không cần Task Scheduler đã cài.
+
 ## Dữ liệu riêng và giới hạn
 
 - Secret được lưu bằng JSON local, không ghi vào mã nguồn và không cần dotenv:
@@ -299,7 +319,7 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   | --- | --- |
   | `.telegram-codex/config.json` | Token BotFather, ID chủ bot/nhóm và chat cầu nối |
   | `.telegram-codex/user-session.json` | Telegram api_id/api_hash và phiên đăng nhập cá nhân |
-  | `.telegram-codex/state.json` | Tuyến topic, mốc đọc và các prompt lịch sử cần bỏ qua |
+  | `.telegram-codex/state.json` | Tuyến topic, mốc đọc, hàng gửi/receipt và các prompt lịch sử cần bỏ qua |
 
   Cả folder `.telegram-codex/` được ignore, bao gồm ảnh, log, QR và thư viện
   cài riêng. `.env` và `.env.*` cũng bị ignore. Bridge đọc hai file JSON nêu trên,
@@ -324,6 +344,13 @@ Codex mở và đọc nội dung. Dữ liệu, ảnh và log của lần thử k
   file lịch sử local của đúng chat, giữ ID và mốc trang để không gửi trùng.
   Không chuyển reasoning, log công cụ hoặc dữ liệu ảnh nhúng. File gốc không
   bị sửa; nếu không khớp ID/mốc trang thì báo lỗi và không đoán lịch sử.
+- Quét nội dung và inventory độc lập. Background read quá 5 giây chuyển sang
+  local khi đúng lỗi timeout; snapshot local không được dùng để đoán trạng thái
+  runtime hoặc cấp quyền. Lỗi đọc giữ để thử lại, không tự bỏ mốc còn thiếu.
+- Hàng gửi thử lại lỗi mạng theo từng phần, nghỉ tăng dần đến 60 giây và tuân
+  thủ flood wait. Chỉ đánh dấu hoàn tất sau ACK đủ các phần. Bot API mất ACK có
+  thể làm phần chưa rõ được gửi trùng theo ưu tiên không bỏ tin; không bảo đảm
+  exactly-once. Prompt thực thi chưa rõ kết quả vẫn không tự chạy lại.
 - Chờ quyền được phát hiện bằng trạng thái `waitingOnApproval`, kiểm tra mỗi 3 giây.
   Bot gửi nội dung và nút quyết định cho loại yêu cầu đã hỗ trợ; các loại khác
   vẫn báo để xem và xử lý trong Codex App.

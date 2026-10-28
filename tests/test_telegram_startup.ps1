@@ -1,9 +1,11 @@
 # Integration check: run after installing startup; it does not register or stop tasks.
+param([switch]$LauncherOnly)
 $ErrorActionPreference = 'Stop'
 $testRoot = Split-Path -Parent $PSScriptRoot
-$testTask = Get-ScheduledTask -TaskName 'Codex Telegram Bridge' -ErrorAction Stop
 $testLauncher = Join-Path $testRoot 'scripts\start_telegram_codex.ps1'
 $testBridge = Join-Path $testRoot 'scripts\telegram_codex.mjs'
+if (!$LauncherOnly) {
+$testTask = Get-ScheduledTask -TaskName 'Codex Telegram Bridge' -ErrorAction Stop
 if (!$testTask.Settings.Enabled) { throw 'Startup task disabled.' }
 if (!$testTask.Triggers -or !$testTask.Triggers[0].Enabled -or !$testTask.Triggers[0].CimClass.CimClassName.EndsWith('LogonTrigger')) {
     throw 'Missing enabled logon trigger.'
@@ -27,6 +29,7 @@ $testPid = [int](Get-Content -LiteralPath (Join-Path $testRoot '.telegram-codex\
 if ($testPid -ne $testProcesses[0].ProcessId) { throw 'PID lock does not match the running bot.' }
 $testLog = Get-Content -LiteralPath (Join-Path $testRoot '.telegram-codex\stdout.log') -Raw -Encoding UTF8
 if ($testLog -notmatch 'Ctrl\+C') { throw 'Bot has not confirmed readiness.' }
+}
 
 # Reproduce Codex being unavailable initially without closing the user's Codex App.
 $testRetryRoot = Join-Path ([IO.Path]::GetTempPath()) ('telegram startup retry-' + [Guid]::NewGuid().ToString('N'))
@@ -39,12 +42,17 @@ try {
     Set-Content -LiteralPath (Join-Path $testRetryLocal 'config.json') -Value '{}' -Encoding ASCII
     @'
 import fs from 'node:fs';
+import {spawn} from 'node:child_process';
 const local = new URL('../.telegram-codex/', import.meta.url);
 const file = new URL('attempts.txt', local);
 const attempt = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;
 fs.writeFileSync(new URL('test.pid', local), String(process.pid));
 fs.writeFileSync(file, String(attempt));
-if (attempt === 1) { console.error('Codex unavailable (test)'); process.exit(1); }
+if (attempt === 1) {
+  const child=spawn(process.execPath,['-e','/* TELEGRAM_STARTUP_DESCENDANT */ setTimeout(()=>{},60000)'],{detached:true,stdio:'inherit',windowsHide:true});
+  fs.writeFileSync(new URL('descendant.pid',local),String(child.pid));child.unref();
+  console.error('Codex unavailable (test)');process.exit(1);
+}
 console.log('READY_AFTER_RETRY');
 setInterval(() => {}, 1000);
 '@ | Set-Content -LiteralPath (Join-Path $testRetryScript 'telegram_codex.mjs') -Encoding ASCII
@@ -65,6 +73,8 @@ setInterval(() => {}, 1000);
     if (!$testRetryReady -or [int](Get-Content -LiteralPath (Join-Path $testRetryLocal 'attempts.txt')) -ne 2) {
         throw 'Bot did not recover after the initial startup failure.'
     }
+    $testDescendantPid = [int](Get-Content -LiteralPath (Join-Path $testRetryLocal 'descendant.pid'))
+    if (!(Get-Process -Id $testDescendantPid -ErrorAction SilentlyContinue)) { throw 'Recovery must not wait for the surviving descendant.' }
 } finally {
     if ($testRetryProcess -and !$testRetryProcess.HasExited) { Stop-Process -Id $testRetryProcess.Id -Force; $testRetryProcess.WaitForExit() }
     $testRetryPidFile = Join-Path $testRetryLocal 'test.pid'
@@ -77,9 +87,15 @@ setInterval(() => {}, 1000);
             Wait-Process -Id $testRetryPid -Timeout 10 -ErrorAction SilentlyContinue
         }
     }
+    $testDescendantFile = Join-Path $testRetryLocal 'descendant.pid'
+    if (Test-Path -LiteralPath $testDescendantFile) {
+        $testDescendantPid = [int](Get-Content -LiteralPath $testDescendantFile)
+        $testDescendant = Get-CimInstance Win32_Process -Filter "ProcessId=$testDescendantPid"
+        if ($testDescendant.Name -eq 'node.exe' -and $testDescendant.CommandLine -like '*TELEGRAM_STARTUP_DESCENDANT*') { Stop-Process -Id $testDescendantPid -Force }
+    }
     $testRetryPath = [IO.Path]::GetFullPath($testRetryRoot)
     $testTempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\telegram startup retry-'
     if (!$testRetryPath.StartsWith($testTempPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path.' }
     Remove-Item -LiteralPath $testRetryPath -Recurse -Force
 }
-Write-Output 'telegram_startup: logon, hidden launch, single process, readiness and recovery after startup failure passed.'
+Write-Output 'telegram_startup: selected startup checks and recovery while a descendant retains stdout passed.'

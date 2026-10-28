@@ -18,11 +18,11 @@ const input = text => ({ message: { ...msg, text } });
 await bridge.handle({ message: { ...msg, from: { id: 99 }, text: '/restart' } });
 assert.deepEqual(lifecycle, [], 'unauthorized senders cannot control the app');
 await bridge.handle(input('/start')); await bridge.handle(input('/restart'));
-assert.deepEqual(lifecycle, ['start', 'restart']);
+assert.deepEqual(lifecycle, ['restart'], 'an already available App does not need a Windows launch; restart remains explicit');
 assert(calls.every(c => c.tool === 'list_threads'), 'lifecycle commands never send model prompts');
 await assert.rejects(async () => controlCodexApp('shutdown'), /Invalid app action/);
 
-// Startup uses the same sequence as /start, without probing before the launch completes.
+// Startup reuses the available App, otherwise launches and waits for readiness.
 const startupEvents = [];
 let readyAttempts = 0;
 const startup = new Bridge({ ownerId: 1 }, {}, async (tool, args) => {
@@ -37,11 +37,14 @@ startup.appControl = async action => {
   startupEvents.push('launched');
 };
 assert.equal(await startup.startApp('start', async () => { startupEvents.push('wait'); }), true);
-assert.deepEqual(startupEvents, ['start', 'launched', 'probe', 'wait', 'probe', 'wait', 'probe']);
+assert.deepEqual(startupEvents, ['probe', 'start', 'launched', 'probe', 'wait', 'probe']);
 startup.appControl = async () => { throw new Error('Launch failed'); };
 const beforeFailedLaunch = readyAttempts;
+assert.equal(await startup.startApp(), true, 'a working pipe must avoid a failing Windows process query');
+assert.equal(readyAttempts, beforeFailedLaunch + 1);
+startup.call = async () => { throw new Error('App unavailable'); };
 await assert.rejects(startup.startApp(), /Launch failed/);
-assert.equal(readyAttempts, beforeFailedLaunch, 'failed launch must not probe Codex');
+assert.equal(readyAttempts, beforeFailedLaunch + 1, 'failed launch must not continue readiness polling');
 startup.appControl = async () => {};
 startup.call = async () => { throw new Error('App unavailable'); };
 assert.equal(await startup.startApp('start', async () => {}), false, 'timeout must not report readiness');

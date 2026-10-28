@@ -3,6 +3,30 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 28/10/2026 — Gửi bền và xử lý nhiều chat độc lập
+
+- Mỗi chat có worker gửi riêng; Telegram/upload chậm không giữ pool đọc chat.
+  Lưu outbox trước khi cập nhật mốc đọc và lưu receipt từng phần trong state.
+  Restart tiếp tục phần chưa xác nhận, retry lỗi mạng không giới hạn số lần.
+- Prompt desktop chép bằng tài khoản cá nhân giữ MTProto random_id qua retry;
+  update xác nhận bản sao bị mất ACK, không biến thành prompt chạy lại.
+- Tách quét nội dung khỏi inventory, giới hạn background read 5 giây và đọc
+  local khi App timeout. Giữ readPending để thử lại ngay cả khi timestamp không
+  đổi; không đoán trạng thái approval/runtime từ local snapshot.
+- Nhận câu lỗi kích thước mới của App. Cache projection và đọc phần nối thêm,
+  giữ cursor/ID, xử lý file đổi hoặc dòng ghi dở. Tra index SQLite khi filename
+  continuation không khớp mẫu cũ; kiểm tra session_meta đúng chat.
+- Lịch sử chọn chat, /update và prompt đầu chat mới dùng hàng gửi bền. Lệnh,
+  prompt và thao tác phê duyệt chưa rõ kết quả vẫn không tự thực hiện lại.
+- File trên 50 MiB dùng MTProto bot với credentials local có sẵn; giữ bộ chặn
+  file riêng tư. Giữ link thư mục và URL web dạng chữ, không nhận nhầm thành file.
+- Tách lỗi gửi prompt khỏi lỗi gửi tin xác nhận Telegram. Startup dùng App đang
+  mở trước; launcher chờ riêng tiến trình bot bằng WaitForExit có timeout.
+- Test bao phủ 108 chat, bốn sender bị giữ, 12 lỗi liên tiếp, receipt từng phần,
+  crash/restart bằng hai tiến trình thật, prompt-copy không chạy lại và trạng
+  thái approval. Transport Telegram của các phép thử lỗi được giả lập; smoke
+  triển khai thật xác nhận tin về đúng topic. Runtime/evidence không nằm trong Git.
+
 ## 27/10/2026 — Thay topic với toàn bộ lịch sử bằng /full
 
 - Gửi `/full` trong topic đã liên kết: tạo topic mới cùng chat Codex, chép toàn

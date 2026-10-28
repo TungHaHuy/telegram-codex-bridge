@@ -63,6 +63,13 @@ try {
     assert.equal(tool, 'list_threads');
     return { threads: [metadata], pinnedThreads: [] };
   };
+  const currentLimit = await readThread(async (tool, args) => {
+    if (tool === 'read_thread') throw new Error('Tool response exceeds the size limit. Request fewer turns or omit outputs. A single oversized turn cannot be returned by this tool.');
+    assert.equal(tool, 'list_threads');
+    return { threads: [metadata], pinnedThreads: [] };
+  }, { threadId: id }, root);
+  assert.equal(currentLimit.turns[0].id, 'three', 'current App size-limit wording uses the existing local projection');
+  await assert.rejects(readThread(async () => { throw new Error('unrelated timeout'); }, { threadId: id }, root), /unrelated timeout/);
   const recovered = await readThread(call, { threadId: id, turnLimit: 1 }, root);
   assert.deepEqual(recovered.thread, metadata, 'runtime flags come from the App, not a guessed local status');
   await readThread(call, { threadId: id, turnLimit: 1, cursor: cursor(second) }, root);
@@ -70,6 +77,23 @@ try {
   await assert.rejects(readThread(async () => { throw new Error('network unavailable'); }, { threadId: id }, root), /network unavailable/);
   const native = { native: true };
   assert.equal(await readThread(async () => native, { threadId: id }, '/missing'), native);
+  const indexedHome = path.join(root, 'indexed');
+  fs.mkdirSync(path.join(indexedHome, 'sessions'), { recursive: true });
+  const indexedFile = path.join(indexedHome, 'sessions', 'rollout-' + id + '_continued.jsonl');
+  fs.writeFileSync(indexedFile, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+  const { DatabaseSync } = await import('node:sqlite');
+  const indexDb = new DatabaseSync(path.join(indexedHome, 'state_5.sqlite'));
+  try {
+    indexDb.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)');
+    indexDb.prepare('INSERT INTO threads VALUES (?, ?)').run(id, indexedFile);
+    const indexed = await readLocalTurnPage(id, {}, indexedHome);
+    assert.equal(indexed.turns[0].id, 'three', 'use the owning index for continuation filenames');
+    assert.equal((await readLocalTurnPage(id, { cursor: indexed.page.nextCursor }, indexedHome)).turns[0].id, 'two');
+    const wrongFile = path.join(indexedHome, 'sessions', 'wrong.jsonl');
+    fs.writeFileSync(wrongFile, JSON.stringify({ type: 'session_meta', payload: { id: 'another-thread' } }) + '\n');
+    indexDb.prepare('UPDATE threads SET rollout_path = ? WHERE id = ?').run(wrongFile, id);
+    await assert.rejects(readLocalTurnPage(id, {}, indexedHome), /không khớp ID chat/);
+  } finally { indexDb.close(); }
   process.env.CODEX_HOME = root;
   const sent = [];
   const bridge = new Bridge({ ownerId: 42 }, { selected: id, routes: {}, seen: {}, threads: { [id]: { title: 'Test' } }, enabled: { [id]: true } },
@@ -102,6 +126,31 @@ try {
   assert(historyMessages.some(text => text.includes('First reply')));
   fs.appendFileSync(file, '{"type":"event_msg",');
   assert.equal((await readLocalTurnPage(id, {}, root)).turns[0].id, 'three', 'live partial tail does not break completed history');
+  fs.appendFileSync(file, '"payload":' + JSON.stringify({ thread_id: id, turn_id: 'three', type: 'item_completed', item: {
+    type: 'AgentMessage', id: 'appended', phase: 'commentary', content: [{ type: 'Text', text: 'New visible progress' }],
+  } }) + '}\n');
+  const createStream = fs.createReadStream, offsets = [];
+  try {
+    fs.createReadStream = (name, options) => { offsets.push(options?.start); return createStream(name, options); };
+    const appended = await readLocalTurnPage(id, {}, root);
+    assert(appended.turns[0].items.some(item => item.id === 'appended'), 'finish a partial line without losing the event');
+    assert(offsets[0] > 0, 'polling reads only bytes appended after the previous complete snapshot');
+    offsets.length = 0;
+    assert.deepEqual(await readLocalTurnPage(id, {}, root), appended);
+    assert.deepEqual(offsets, [], 'unchanged history does not reopen the full rollout stream');
+    fs.appendFileSync(file, [event('three', { type: 'task_complete' }), start('four'),
+      item('four', { type: 'AgentMessage', id: 'four-progress', phase: 'commentary', content: [{ type: 'Text', text: 'Fourth turn' }] }),
+    ].map(r => JSON.stringify(r)).join('\n') + '\n');
+    const fourth = await readLocalTurnPage(id, {}, root);
+    assert.equal(fourth.turns[0].id, 'four');
+    assert.equal((await readLocalTurnPage(id, { cursor: fourth.page.nextCursor }, root)).turns[0].id, 'three',
+      'incremental reads retain native cursor line ordinals');
+    const changed = fs.readFileSync(file, 'utf8').replace('Fourth turn', 'FOURTH TURN');
+    fs.writeFileSync(file, changed);
+    const rebuilt = await readLocalTurnPage(id, {}, root);
+    assert.equal(rebuilt.turns[0].items[0].text, 'FOURTH TURN', 'rewrites invalidate the append cache');
+    assert.equal(offsets.at(-1), 0);
+  } finally { fs.createReadStream = createStream; }
   const longReply = 'Full response '.repeat(2500);
   const fullRows = [{ type: 'session_meta', payload: { id } }];
   for (let n = 0; n < 25; n++) fullRows.push(start('full-' + n),

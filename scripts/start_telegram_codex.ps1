@@ -26,9 +26,13 @@ if ($Background) {
     $taskBridge = Join-Path $PSScriptRoot 'telegram_codex.mjs'
     while ($true) {
         $taskProcess = Start-Process -FilePath $taskNode -ArgumentList ('"' + $taskBridge + '"') `
-            -WorkingDirectory $taskRoot -WindowStyle Hidden -Wait -PassThru `
+            -WorkingDirectory $taskRoot -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput (Join-Path $taskLocal 'stdout.log') `
             -RedirectStandardError (Join-Path $taskLocal 'stderr.log')
+        # Wait for the bot itself, not the apps/console descendants it launched.
+        # A bounded wait observes this process without waiting for inherited
+        # stdout handles held by descendants (including an opened Codex App).
+        while (!$taskProcess.WaitForExit(1000)) {}
         if ($taskProcess.ExitCode -eq 0) { exit 0 }
         Start-Sleep -Seconds 15
     }
