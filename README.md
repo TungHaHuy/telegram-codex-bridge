@@ -288,6 +288,7 @@ Kiểm tra tự động không cần token hoặc mạng; probe đọc thử Cod
 node tests/test_telegram_codex.mjs
 node tests/test_telegram_history.mjs
 node tests/test_telegram_controls.mjs
+node tests/test_telegram_ipc.mjs
 node tests/test_telegram_user.mjs
 node tests/test_telegram_concurrency.mjs
 node tests/test_telegram_read_timeout.mjs
@@ -312,6 +313,10 @@ thử lỗi được giả lập. `test_telegram_startup.ps1 -LauncherOnly` ki�
 khởi động lại bằng tiến trình giả, không cần Task Scheduler đã cài.
 
 ## Dữ liệu riêng và giới hạn
+
+IPC nhận frame tới 1 GiB. Snapshot/App call/launcher chờ 5 phút; Desktop IPC
+chờ 6 phút (deadline gửi vào App 5 phút). Telegram request chờ 5 phút, tải file
+10 phút và Bot API upload 30 phút. Các giới hạn của dịch vụ Telegram vẫn áp dụng.
 
 - Secret được lưu bằng JSON local, không ghi vào mã nguồn và không cần dotenv:
 
@@ -344,7 +349,7 @@ khởi động lại bằng tiến trình giả, không cần Task Scheduler đ�
   file lịch sử local của đúng chat, giữ ID và mốc trang để không gửi trùng.
   Không chuyển reasoning, log công cụ hoặc dữ liệu ảnh nhúng. File gốc không
   bị sửa; nếu không khớp ID/mốc trang thì báo lỗi và không đoán lịch sử.
-- Quét nội dung và inventory độc lập. Background read quá 5 giây chuyển sang
+- Quét nội dung và inventory độc lập. Background read quá 30 giây chuyển sang
   local khi đúng lỗi timeout; snapshot local không được dùng để đoán trạng thái
   runtime hoặc cấp quyền. Lỗi đọc giữ để thử lại, không tự bỏ mốc còn thiếu.
 - Hàng gửi thử lại lỗi mạng theo từng phần, nghỉ tăng dần đến 60 giây và tuân

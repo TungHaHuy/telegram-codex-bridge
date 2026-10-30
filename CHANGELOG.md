@@ -3,6 +3,19 @@
 Lịch sử thay đổi theo ngày phát hành. Các bản cũ có commit Git để đối chiếu;
 không tự đặt số phiên bản. Phần kiểm thử phân biệt kết quả thực tế và mô phỏng.
 
+## 30/10/2026 — Nới dung lượng và thời gian chờ
+
+- Ba đường đọc IPC dùng mức 1 GiB thay cho 8 MiB. Dùng buffer của socket để
+  ghép frame một lần, tránh chép lại toàn bộ dữ liệu mỗi khi nhận thêm một đoạn.
+- Snapshot, App tool call và launcher chờ 5 phút; Desktop IPC chờ 6 phút và
+  gửi deadline 5 phút cho App. Chờ chat nạp sau điều hướng tối đa 60 lần, cách
+  nhau 1 giây; chờ tiến trình App dừng tối đa 60 giây.
+- Đọc nền chờ 30 giây trước khi chuyển sang lịch sử local. Telegram request
+  chờ 5 phút, tải file 10 phút và Bot API upload 30 phút. Không đổi các giới hạn
+  của Telegram, quy trình duyệt quyền, thứ tự gửi hay receipt chống gửi lặp.
+- Test IPC thật với frame 16 MiB ở cả ba đường, header/body bị chia nhỏ,
+  nhiều frame cùng packet, snapshot sau 8 giây, frame lỗi và timeout tường minh.
+
 ## 28/10/2026 — Gửi bền và xử lý nhiều chat độc lập
 
 - Mỗi chat có worker gửi riêng; Telegram/upload chậm không giữ pool đọc chat.

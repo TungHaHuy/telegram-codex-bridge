@@ -15,7 +15,7 @@ if ($Action -eq 'restart') {
             if ($LASTEXITCODE -ne 0) { throw 'Could not stop the Codex process tree.' }
         }
     }
-    foreach ($item in $processes) { Wait-Process -Id $item.ProcessId -Timeout 10 -ErrorAction SilentlyContinue }
+    foreach ($item in $processes) { Wait-Process -Id $item.ProcessId -Timeout 60 -ErrorAction SilentlyContinue }
 } elseif ($processes.Count -gt 0) {
     Write-Output 'Codex is already running.'
     return

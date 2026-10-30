@@ -30,7 +30,7 @@ try {
   ].join('\n') + '\n');
   const bridge = new Bridge({ ownerId: 42, chatId: -1001234 }, state, async (tool, args, options) => {
     if (tool === 'list_threads') {
-      assert.equal(options?.timeout, 5000);
+      assert.equal(options?.timeout, 30000);
       if (inventoryBusy) throw new Error(timeout);
       return { threads: Object.values(state.threads), pinnedThreads: [] };
     }
@@ -49,7 +49,7 @@ try {
   assert(outputs.some(m => m.message_thread_id === 102 && m.text === 'NATIVE_B\n[end]'));
   assert.equal(state.attention[A], 'prior-approval', 'local content cannot clear or invent live approval status');
   assert.equal(approvalReads, 0);
-  assert(reads.every(read => read.options.timeout === 5000));
+  assert(reads.every(read => read.options.timeout === 30000));
   state.threads[A].updatedAt++;
   await bridge.scan();
   assert.equal(reads.filter(read => read.id === A).length, 1, 'avoid hammering an unresponsive App on every content poll');
@@ -101,4 +101,4 @@ try {
   assert(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep));
   fs.rmSync(root, { recursive: true });
 }
-console.log('telegram_read_timeout: local delivery, stale idle inventory, deduplication, cooldown, 5-second background deadline and unchanged control acknowledgement passed.');
+console.log('telegram_read_timeout: local delivery, stale idle inventory, deduplication, cooldown, 30-second background deadline and unchanged control acknowledgement passed.');

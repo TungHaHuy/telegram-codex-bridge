@@ -6,11 +6,10 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
-import { controlCodexApp, modelCatalog, threadSnapshot, approvalChoices, ensureOwner } from './telegram_codex_controls.mjs';
+import { controlCodexApp, modelCatalog, threadSnapshot, approvalChoices, ensureOwner, readIpcFrames, IPC_TIMEOUT_MS } from './telegram_codex_controls.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const LOCAL = path.join(ROOT, '.telegram-codex');
-const MAX_FRAME = 8 * 1024 * 1024;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const localTurnCache = new Map();
 
@@ -36,10 +35,9 @@ export function saveJson(file, value) {
 }
 
 // Same local protocol as the installed codex-app-tools plugin. No public listener.
-export function pipeRequest(pipe, method, params, timeout = 30000) {
+export function pipeRequest(pipe, method, params, timeout = IPC_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(pipe);
-    let data = Buffer.alloc(0);
     const timer = setTimeout(() => finish(new Error('Codex App timeout; kết quả chưa xác định.')), timeout);
     function finish(error, value) {
       clearTimeout(timer);
@@ -54,18 +52,10 @@ export function pipeRequest(pipe, method, params, timeout = 30000) {
       header.writeUInt32LE(body.length);
       socket.write(Buffer.concat([header, body]));
     });
-    socket.on('data', chunk => {
-      data = Buffer.concat([data, chunk]);
-      if (data.length < 4) return;
-      const length = data.readUInt32LE(0);
-      if (length > MAX_FRAME) return finish(new Error('Codex App response quá lớn.'));
-      if (data.length < length + 4) return;
-      try {
-        const response = JSON.parse(data.subarray(4, length + 4).toString('utf8'));
-        if (response.error) throw new Error(response.error.message);
-        finish(null, response.result);
-      } catch (error) { finish(error); }
-    });
+    readIpcFrames(socket, response => {
+      if (response.error) throw new Error(response.error.message);
+      finish(null, response.result);
+    }, finish);
   });
 }
 
@@ -78,7 +68,7 @@ export function findPipe() {
   return '\\\\.\\pipe\\' + names[0];
 }
 
-export async function appCall(callerThreadId, tool, args, timeout = 30000) {
+export async function appCall(callerThreadId, tool, args, timeout = IPC_TIMEOUT_MS) {
   const response = await pipeRequest(findPipe(), 'tools/call', {
     arguments: args, callerSource: 'codex', hostId: 'local', namespace: 'codex_app',
     threadId: callerThreadId, tool,
@@ -226,8 +216,8 @@ export async function readThread(call, args, codexHome) {
 export function desktopRequest(method, params, version, targetClientId, endpoint = '\\\\.\\pipe\\codex-ipc') {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(endpoint);
-    let data = Buffer.alloc(0), clientId = 'initializing-client', requestId;
-    const timer = setTimeout(() => finish(new Error('Codex Desktop IPC timeout; kết quả chưa xác định.')), 15000);
+    let clientId = 'initializing-client', requestId;
+    const timer = setTimeout(() => finish(new Error('Codex Desktop IPC timeout; kết quả chưa xác định.')), IPC_TIMEOUT_MS + 60000);
     function finish(error, result) {
       clearTimeout(timer); socket.destroy();
       error ? reject(error) : resolve(result);
@@ -235,37 +225,27 @@ export function desktopRequest(method, params, version, targetClientId, endpoint
     function send(name, args, revision, target) {
       requestId = crypto.randomUUID();
       const body = Buffer.from(JSON.stringify({ type: 'request', requestId, sourceClientId: clientId,
-        method: name, params: args, version: revision, targetClientId: target, timeoutMs: 10000 }));
+        method: name, params: args, version: revision, targetClientId: target, timeoutMs: IPC_TIMEOUT_MS }));
       const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
       socket.write(Buffer.concat([header, body]));
     }
     socket.once('error', error => finish(error));
     socket.once('end', () => finish(new Error('Codex Desktop IPC đóng kết nối.')));
     socket.once('connect', () => send('initialize', { clientType: 'telegram-codex' }, 0));
-    socket.on('data', chunk => {
-      data = Buffer.concat([data, chunk]);
-      try {
-        while (data.length >= 4) {
-          const size = data.readUInt32LE(0);
-          if (size > MAX_FRAME) throw new Error('Codex Desktop IPC frame quá lớn.');
-          if (data.length < size + 4) break;
-          const message = JSON.parse(data.subarray(4, size + 4).toString('utf8'));
-          data = data.subarray(size + 4);
-          if (message.type === 'client-discovery-request') {
-            const body = Buffer.from(JSON.stringify({ type: 'client-discovery-response', requestId: message.requestId,
-              response: { canHandle: false } }));
-            const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
-            socket.write(Buffer.concat([header, body]));
-          }
-          if (message.type !== 'response' || message.requestId !== requestId) continue;
-          if (message.resultType !== 'success') throw new Error(message.error || 'Codex Desktop từ chối thao tác.');
-          if (clientId === 'initializing-client') {
-            clientId = message.result.clientId;
-            send(method, params, version, targetClientId);
-          } else return finish(null, message);
-        }
-      } catch (error) { finish(error); }
-    });
+    readIpcFrames(socket, message => {
+      if (message.type === 'client-discovery-request') {
+        const body = Buffer.from(JSON.stringify({ type: 'client-discovery-response', requestId: message.requestId,
+          response: { canHandle: false } }));
+        const header = Buffer.alloc(4); header.writeUInt32LE(body.length);
+        socket.write(Buffer.concat([header, body]));
+      }
+      if (message.type !== 'response' || message.requestId !== requestId) return;
+      if (message.resultType !== 'success') throw new Error(message.error || 'Codex Desktop từ chối thao tác.');
+      if (clientId === 'initializing-client') {
+        clientId = message.result.clientId;
+        send(method, params, version, targetClientId);
+      } else return finish(null, message);
+    }, finish);
   });
 }
 
@@ -381,7 +361,7 @@ async function downloadTelegramFile(file, telegram, token, fetchFile) {
   if (!info.file_path) throw new Error('Telegram chưa cung cấp đường dẫn tải file.');
   const response = await fetchFile('https://api.telegram.org/file/bot' + token + '/' +
     info.file_path.split('/').map(encodeURIComponent).join('/'), {
-    signal: AbortSignal.timeout(45000), redirect: 'error',
+    signal: AbortSignal.timeout(10 * 60 * 1000), redirect: 'error',
   });
   if (!response.ok) throw new Error('Không tải được file Telegram (HTTP ' + response.status + ').');
   const bytes = Buffer.from(await response.arrayBuffer());
@@ -1366,7 +1346,7 @@ export class Bridge {
   async scanDesktop(options) {
     let inventory;
     try {
-      inventory = await this.rawCall('list_threads', { limit: 50 }, { timeout: 5000 });
+      inventory = await this.rawCall('list_threads', { limit: 50 }, { timeout: 30000 });
       this.inventoryStale = false;
     } catch (error) {
       this.inventoryStale = error.message === 'Codex App timeout; kết quả chưa xác định.';
@@ -1391,9 +1371,8 @@ export class Bridge {
     const local = () => readLocalTurnPage(args.threadId, args);
     if (this.inventoryStale || (this.localReadUntil.get(args.threadId) || 0) > Date.now()) return local();
     try {
-      // Background reads are safe to abandon. Prompt/control submissions keep
-      // their original timeout and must never be replayed after uncertainty.
-      return await readThread((tool, body) => this.rawCall(tool, body, { timeout: 5000 }), args);
+      // Background reads can recover from disk; uncertain submissions are never replayed.
+      return await readThread((tool, body) => this.rawCall(tool, body, { timeout: 30000 }), args);
     } catch (error) {
       if (error.message !== 'Codex App timeout; kết quả chưa xác định.') throw error;
       this.localReadUntil.set(args.threadId, Date.now() + 60000);
@@ -1528,7 +1507,7 @@ export async function telegram(token, method, body) {
     method: 'POST', ...(upload ? { body: await telegramFileBody(body) } : {
       headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     }),
-    signal: AbortSignal.timeout(upload ? 180000 : 45000),
+    signal: AbortSignal.timeout(upload ? 30 * 60 * 1000 : IPC_TIMEOUT_MS),
   });
   const data = await response.json();
   if (!data.ok) {

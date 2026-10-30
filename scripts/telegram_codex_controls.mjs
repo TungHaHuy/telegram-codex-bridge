@@ -6,12 +6,35 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+export const IPC_TIMEOUT_MS = 5 * 60 * 1000;
+
+// Socket buffering assembles each frame once, including large chat snapshots.
+export function readIpcFrames(socket, receive, fail) {
+  let size;
+  socket.on('readable', () => {
+    try {
+      while (!socket.destroyed) {
+        if (size === undefined) {
+          const header = socket.read(4);
+          if (!header) return;
+          size = header.readUInt32LE(0);
+          if (!size || size > 1024 * 1024 * 1024) throw new Error('Codex IPC frame không hợp lệ hoặc vượt 1 GiB.');
+        }
+        const body = socket.read(size);
+        if (!body) return;
+        size = undefined;
+        receive(JSON.parse(body.toString('utf8')));
+      }
+    } catch (error) { fail(error); }
+  });
+}
+
 export function controlCodexApp(action) {
   if (!['start', 'restart'].includes(action)) throw new Error('Invalid app action.');
   const script = fileURLToPath(new URL('./control_codex_app.ps1', import.meta.url));
   const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe');
   return new Promise((resolve, reject) => execFile(powershell, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-    '-File', script, '-Action', action], { windowsHide: true, timeout: 30000 }, (error, stdout) => error ? reject(error) : resolve(stdout.trim())));
+    '-File', script, '-Action', action], { windowsHide: true, timeout: IPC_TIMEOUT_MS }, (error, stdout) => error ? reject(error) : resolve(stdout.trim())));
 }
 
 export function modelCatalog(codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex')) {
@@ -26,7 +49,7 @@ export function modelCatalog(codexHome = process.env.CODEX_HOME || path.join(os.
 export function threadSnapshot(threadId, endpoint = '\\\\.\\pipe\\codex-ipc') {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(endpoint);
-    let data = Buffer.alloc(0), client = 'initializing-client', done = false;
+    let client = 'initializing-client', done = false;
     const requestId = crypto.randomUUID();
     const send = message => {
       const body = Buffer.from(JSON.stringify(message)), header = Buffer.alloc(4);
@@ -39,30 +62,21 @@ export function threadSnapshot(threadId, endpoint = '\\\\.\\pipe\\codex-ipc') {
       if (client !== 'initializing-client' && socket.writable) following(false);
       socket.end(); socket.destroy(); error ? reject(error) : resolve(result);
     };
-    const timer = setTimeout(() => finish(new Error('Không đọc được trạng thái trực tiếp của chat.')), 8000);
+    const timer = setTimeout(() => finish(new Error('Không đọc được trạng thái trực tiếp của chat.')), IPC_TIMEOUT_MS);
     socket.once('connect', () => send({ type: 'request', requestId, sourceClientId: client, version: 0,
       method: 'initialize', params: { clientType: 'telegram-codex' } }));
     socket.once('error', error => finish(error));
     socket.once('end', () => finish(new Error('Codex đóng kết nối snapshot.')));
-    socket.on('data', chunk => {
-      data = Buffer.concat([data, chunk]);
-      try {
-        while (data.length >= 4) {
-          const size = data.readUInt32LE(0);
-          if (size > 8 * 1024 * 1024) throw new Error('Codex snapshot quá lớn.');
-          if (data.length < size + 4) break;
-          const message = JSON.parse(data.subarray(4, size + 4)); data = data.subarray(size + 4);
-          if (message.type === 'client-discovery-request') send({ type: 'client-discovery-response', requestId: message.requestId, response: { canHandle: false } });
-          if (message.type === 'response' && message.requestId === requestId) {
-            if (message.resultType !== 'success') throw new Error(message.error || 'Codex từ chối snapshot.');
-            client = message.result.clientId; following(true);
-          }
-          if (message.method === 'thread-stream-state-changed' && message.params?.conversationId === threadId && message.params.change?.type === 'snapshot') {
-            finish(null, message.params.change.conversationState);
-          }
-        }
-      } catch (error) { finish(error); }
-    });
+    readIpcFrames(socket, message => {
+      if (message.type === 'client-discovery-request') send({ type: 'client-discovery-response', requestId: message.requestId, response: { canHandle: false } });
+      if (message.type === 'response' && message.requestId === requestId) {
+        if (message.resultType !== 'success') throw new Error(message.error || 'Codex từ chối snapshot.');
+        client = message.result.clientId; following(true);
+      }
+      if (message.method === 'thread-stream-state-changed' && message.params?.conversationId === threadId && message.params.change?.type === 'snapshot') {
+        finish(null, message.params.change.conversationState);
+      }
+    }, finish);
   });
 }
 
@@ -102,8 +116,8 @@ export async function ensureOwner(threadId, call, request) {
   catch (error) {
     if (error.message !== 'no-client-found') throw error;
     await call('navigate_to_codex_page', { threadId });
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 250));
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 1000));
       try { return await request('thread-owner-discovery', { hostId: 'local', conversationId: threadId }, 1); }
       catch (retry) { if (retry.message !== 'no-client-found') throw retry; }
     }
